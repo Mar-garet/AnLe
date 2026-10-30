@@ -7,7 +7,7 @@ const [action, ...rest] = process.argv.slice(2);
 try {
   if (!action || action === 'console') {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      throw new Error('The console requires an interactive terminal. Run serein --help for commands.');
+      throw new Error('The console requires an interactive terminal. Run anle --help for commands.');
     }
     if (process.env.SEREIN_UI === 'classic') {
       const {startConsole} = await import('../src/ui.js');
@@ -17,7 +17,7 @@ try {
       try { await startNativeConsole(); }
       catch (error) {
         if (error.code !== 'ENOENT') throw error;
-        console.error('Serein: tmux is not installed; opening the classic view.');
+        console.error('AnLe: tmux is not installed; opening the classic view.');
         const {startConsole} = await import('../src/ui.js');
         await startConsole();
       }
@@ -35,14 +35,14 @@ try {
     const {startConsole} = await import('../src/ui.js');
     await startConsole();
   } else if (action === '--help' || action === '-h' || action === 'help') {
-    console.log(`SEREIN — Codex session collaboration console
+    console.log(`AnLe — Codex session collaboration console
 
-  serein                                Open the console
-  serein classic                        Open the classic view without tmux
-  serein setup                          Connect Serein MCP to Codex
-  serein peers [--space WORKSPACE]       List nodes in the current workspace
-  serein send --to NODE --message TEXT [--space WORKSPACE]
-  serein reply --reply-to ID --message TEXT [--space WORKSPACE]
+  anle                                  Open the console
+  anle classic                          Open the classic view without tmux
+  anle setup                            Connect AnLe MCP to Codex
+  anle peers [--space WORKSPACE]         List nodes in the current workspace
+  anle send --to NODE --message TEXT [--space WORKSPACE]
+  anle reply --reply-to ID --message TEXT [--space WORKSPACE]
 
 Run send, reply, and peers from a registered Codex session; CODEX_THREAD_ID identifies the sender.
 If the session belongs to multiple workspaces, specify a workspace name or ID with --space.`);
@@ -54,7 +54,7 @@ If the session belongs to multiple workspaces, specify a workspace name or ID wi
     try {
       client = await CodexClient.connect();
       await setupIntegration(client, store.dataDir);
-      console.log('Serein MCP was added to the Codex configuration. Messaging tools are set to be allowed automatically. Existing shared sessions will load the tools after refresh.');
+      console.log('AnLe MCP was added to the Codex configuration. Messaging tools are set to be allowed automatically. Existing shared sessions will load the tools after refresh.');
     } finally { client?.close(); store.close(); }
   } else if (['peers', 'send', 'reply'].includes(action)) {
     const options = parseOptions(rest);
@@ -73,10 +73,10 @@ If the session belongs to multiple workspaces, specify a workspace name or ID wi
       }
     } finally { store.close(); }
   } else {
-    throw new Error(`Unknown command: ${action}. Run serein --help for usage.`);
+    throw new Error(`Unknown command: ${action}. Run anle --help for usage.`);
   }
 } catch (error) {
-  console.error(`Serein: ${error.message || error}`);
+  console.error(`AnLe: ${error.message || error}`);
   process.exitCode = 1;
 }
 

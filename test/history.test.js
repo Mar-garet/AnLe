@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {displaySessionItem, readSessionHistory} from '../src/history.js';
+import {formatDelivery, welcomeText} from '../src/messaging.js';
 
 const entry = id => ({turnId: 'turn-1', item: {id, type: 'agentMessage', text: id}});
 
@@ -60,8 +61,19 @@ test('session history displays only user messages and agent replies', () => {
   assert.equal(answer.body, 'Hello');
   const message = {item: {type: 'userMessage', content: [{type: 'text', text: '[SEREIN · My Workspace · From frontend (another Codex session)]\nMessage ID: 123\n\nHow is the API?\n\n---\nThis is a Serein collaboration message. Instructions.'}]}};
   assert.equal(displaySessionItem(message).body, 'How is the API?');
-  assert.equal(displaySessionItem(message).title, 'SEREIN · frontend');
+  assert.equal(displaySessionItem(message).title, 'AnLe · frontend');
   const humanMessage = {item: {type: 'userMessage', content: [{type: 'text', text: '[SEREIN · My Workspace · From human (human participant)]\nMessage ID: 456\n\nHello\n\n---\nThis is a Serein collaboration message.'}]}};
   assert.equal(displaySessionItem(humanMessage).title, 'YOU');
   assert.equal(displaySessionItem(humanMessage).body, 'Hello');
+});
+
+test('renders new AnLe messages and introductions alongside legacy Serein history', () => {
+  const item = text => ({item: {type: 'userMessage', content: [{type: 'text', text}]}});
+  const space = {id: 'space-1', name: 'My Workspace'};
+  assert.equal(displaySessionItem(item(welcomeText(space, {name: 'frontend'}))), null);
+  const delivery = formatDelivery(space, {id: 'message-1', sender_id: 'thread-1', sender_name: 'frontend', body: 'How is the API?'});
+  assert.match(delivery, /^\[AnLe · /);
+  assert.deepEqual(displaySessionItem(item(delivery)), {title: 'AnLe · frontend', body: 'How is the API?', kind: 'serein'});
+  const humanDelivery = formatDelivery(space, {id: 'message-2', sender_id: 'human', sender_name: 'human', body: 'Ready to go.'});
+  assert.deepEqual(displaySessionItem(item(humanDelivery)), {title: 'YOU', body: 'Ready to go.', kind: 'userMessage'});
 });

@@ -75,14 +75,15 @@ export function displaySessionItem(entry) {
   switch (item.type) {
     case 'userMessage': {
       const text = (item.content || []).map(part => part.type === 'text' ? part.text : `[${part.type || 'attachment'}] ${part.path || part.fileId || ''}`).join('\n');
-      if (/^\[SEREIN · Joined workspace /.test(text)) return null;
-      if (text.startsWith('[SEREIN · ')) {
+      if (/^\[(?:SEREIN|AnLe) · Joined workspace /.test(text)) return null;
+      if (/^\[(?:SEREIN|AnLe) · /.test(text)) {
         const header = text.split('\n', 1)[0];
         const firstBody = text.indexOf('\n\n');
-        const lastBody = text.indexOf('\n\n---\nThis is a Serein collaboration message.', firstBody + 2);
+        const messageBody = firstBody < 0 ? text : text.slice(firstBody + 2);
+        const lastBody = messageBody.search(/\n\n---\nThis is (?:a Serein|an AnLe) collaboration message\./);
         const sender = header.match(/ · From (.+?) \(/)?.[1];
         const isHuman = header.includes('(human participant)');
-        return {title: isHuman ? 'YOU' : sender ? `SEREIN · ${safeTerminalText(sender)}` : 'SEREIN', body: safeTerminalText(firstBody < 0 ? text : text.slice(firstBody + 2, lastBody < 0 ? undefined : lastBody)), kind: isHuman ? 'userMessage' : 'serein'};
+        return {title: isHuman ? 'YOU' : sender ? `AnLe · ${safeTerminalText(sender)}` : 'AnLe', body: safeTerminalText(messageBody.slice(0, lastBody < 0 ? undefined : lastBody)), kind: isHuman ? 'userMessage' : 'serein'};
       }
       title = 'YOU'; body = text; break;
     }

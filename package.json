@@ -1,10 +1,11 @@
 {
-  "name": "serein-console",
+  "name": "anle-console",
   "version": "0.1.0",
   "description": "A local terminal workspace for collaborating Codex sessions.",
   "type": "module",
   "private": true,
   "bin": {
+    "anle": "./bin/serein.js",
     "serein": "./bin/serein.js"
   },
   "scripts": {

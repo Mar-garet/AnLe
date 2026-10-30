@@ -37,7 +37,7 @@ export class CodexClient {
     this.ws.on('message', raw => this.onMessage(raw));
     this.ws.on('close', () => this.failPending(new Error('Disconnected from the Codex server')));
     this.ws.on('error', error => this.failPending(error));
-    await this.request('initialize', {clientInfo: {name: 'serein_console', title: 'Serein Console', version: '0.1.0'}});
+    await this.request('initialize', {clientInfo: {name: 'anle_console', title: 'AnLe Console', version: '0.1.0'}});
     this.notify('initialized', {});
   }
 

@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
       store.addMember('default', {threadId:'mock-long', name:'long-session', cwd:'/tmp/多仓库/very-long-path-with-a-space/nested/前端'});
       store.addMember('default', {threadId:'mock-backend-two', name:'backend-two', cwd:'/tmp/backend'});
       store.addMember('default', {threadId:'mock-fallback', name:'fallback', cwd:'/tmp/fallback-repo'});
-      store.createMessage({spaceId:'default', sender:{id:'mock-agent',name:'frontend'}, recipient:{id:'human',name:'human'}, body:'Need your decision'});
+      store.createMessage({spaceId:'default', sender:{id:'mock-agent',name:'frontend'}, recipient:{id:'human',name:'human'}, body:`Need your decision ${'x'.repeat(180)} DETAIL END`});
       store.createMessage({spaceId:'default', sender:{id:'mock-backend',name:'backend'}, recipient:{id:'human',name:'human'}, body:'Backend needs review'});
       const second = store.createSpace('Second Workspace');
       store.addMember(second.id, {threadId:'mock-backend', name:'backend', cwd:'/tmp/backend'});
@@ -140,14 +140,25 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         def native_screen():
             return tmux('capture-pane', '-p', '-t', native_pane())
 
+        def dogs_visible():
+            lines = native_screen().splitlines()
+            for index, line in enumerate(lines):
+                if re.search(r'\bAn\s+Le\b', line):
+                    art = lines[max(0, index - 12):index]
+                    return sum(bool(re.search(r'[▀▄█]{3}', row)) for row in art) >= 3
+            return False
+
         def send(data):
             os.write(master, data)
             drain(master, .1)
 
         until(lambda: selected('human') and 'frontend' in sidebar() and 'backend-two' in sidebar() and '/tmp/frontend' in sidebar(), 'sidebar and paths did not render')
         brand_header = '\n'.join(sidebar().splitlines()[:5])
-        assert '▄█▀▀█▄' in brand_header and '▀█▄▄▄' in brand_header and 'erein' in brand_header, 'Serein mark and wordmark did not render'
-        assert 'serein' not in brand_header.lower(), 'the wordmark duplicated the S in the logo'
+        assert '▄▀▀▄' in brand_header and '█▄▄█ █▀▀▄' in brand_header and '█▄▄▄ ▀▄▄▄' in brand_header, 'the enlarged AnLe wordmark did not render'
+        assert 'My Workspace' not in brand_header, 'the workspace name appeared under the wordmark'
+        brand_color = next(line for line in tmux('capture-pane', '-p', '-e', '-t', left).splitlines() if '█▄▄█ █▀▀▄' in line)
+        assert re.search(r'█▀▀▄ \x1b\[[0-9;]*m█', brand_color), 'An and Le did not use different foreground colors'
+        assert 'serein' not in brand_header.lower(), 'the old brand still appeared in the sidebar'
         if os.environ.get('SEREIN_SIDEBAR_DUMP'):
             print(sidebar(), flush=True)
         assert sidebar().count('/tmp/backend') == 2
@@ -163,6 +174,10 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         assert len(parts) > 1 and ''.join(parts) == long_path
         until(lambda: tmux('display-message', '-p', '-t', left, '#{mouse_any_flag}') == '1', 'sidebar did not enable mouse reporting')
         until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen() and 'Reply to backend' in native_screen(), 'human inbox and reply input did not render')
+        until(dogs_visible, 'the dogs disappeared when messages arrived')
+        assert '█▀▀▀▀▀█        █▀▀▀▀▀█' not in native_screen(), 'speech bubbles should not appear above the dogs'
+        if os.environ.get('SEREIN_SIDEBAR_DUMP'):
+            print(native_screen(), flush=True)
         # Ctrl+A uses the same path-first layout for existing and new sessions.
         send(b'\x01')
         until(lambda: 'SELECT SESSION' in sidebar() and 'New backend' in sidebar() and '[ADDED]' in sidebar(), 'session picker did not render')
@@ -251,7 +266,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: selected('human') and 'YOUR INBOX' in native_screen() and 'Reply to backend' in native_screen(), 'inbox did not open')
         assert tmux('display-message', '-p', '-t', 'workspace:0', '#{pane_id}') == native_pane()
         send(b'backend reply')
-        until(lambda: 'backend reply' in native_screen(), 'reply text did not appear in the input')
+        until(lambda: 'backend reply' in native_screen() and dogs_visible(), 'dogs or reply text disappeared while typing')
         send(b'\r')
         db = sqlite3.connect(f'file:{work / "state/serein.sqlite"}?mode=ro', uri=True)
         def replies():
@@ -270,8 +285,37 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: len(replies()) == 2 and replies()[-1][4] == 'queued', 'frontend reply was not queued')
         front_reply = replies()[-1]
         assert front_reply[1:3] == ('mock-agent', '前端答复')
-        assert db.execute('SELECT body FROM messages WHERE id = ?', (front_reply[3],)).fetchone()[0] == 'Need your decision'
+        assert db.execute('SELECT body FROM messages WHERE id = ?', (front_reply[3],)).fetchone()[0].startswith('Need your decision')
         assert '--thread\nmock-agent\n' in (work / 'queue.log').read_text()
+        until(dogs_visible, 'the dogs disappeared after replying')
+        send(b'\x1b[<0;190;7M\x1b[<0;190;7m')
+        until(lambda: 'Reply to frontend' in native_screen(), 'clicking the dogs changed the selected message')
+        send(b'\r')
+        until(lambda: 'MESSAGE DETAILS' in native_screen() and 'DETAIL END' in native_screen() and dogs_visible(), 'the dogs or wrapped message were missing from message details')
+        send(b'\x1b')
+        until(lambda: 'YOUR INBOX' in native_screen(), 'message details did not close')
+        # The small portraits remain visible and replies usable in a narrow pane.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 64, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and '▄▀▀▀▄ █▄▄▄█' in native_screen() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'narrow inbox did not retain the dogs alongside messages and reply input')
+        assert re.search(r'\d\d:\d\d\s+frontend\s+READ', native_screen()), 'the frontend sender was clipped in a narrow inbox'
+        assert re.search(r'\d\d:\d\d\s+backend\s+READ', native_screen()), 'the backend sender was clipped in a narrow inbox'
+        if os.environ.get('SEREIN_SIDEBAR_DUMP'):
+            print(native_screen(), flush=True)
+        send(b'x')
+        until(lambda: '› x' in native_screen() and '▄▀▀▀▄ █▄▄▄█' in native_screen(), 'narrow inbox did not retain the dogs while typing')
+        send(b'\x7f')
+        send(b'\r')
+        until(lambda: 'MESSAGE' in native_screen() and 'DETAIL END' in native_screen() and '▄▀▀▀▄ █▄▄▄█' in native_screen() and 'Reply to frontend' in native_screen(), 'narrow message details did not retain the dogs and full text')
+        send(b'\x1b')
+        until(lambda: 'YOUR INBOX' in native_screen(), 'narrow message details did not close')
+        # A short terminal still leaves space for both messages and the composer.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 208, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '18' and dogs_visible() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'short inbox hid the dogs or reply input')
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 208, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: dogs_visible() and 'YOUR INBOX' in native_screen(), 'full dogs did not return after widening the pane')
         # Return to the sidebar, click human and type directly without another shortcut.
         send(b'\x1b[17~')
         send(b'\x1b[<0;8;7M\x1b[<0;8;7m')
@@ -293,7 +337,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         second_inbox = native_pane()
         send(b'\x04')
         until(lambda: 'DELETE WORKSPACE' in sidebar() and 'Second Workspace' in sidebar() and 'Y delete' in sidebar(), 'workspace deletion confirmation did not appear')
-        assert 'Removes 1 node' in sidebar() and 'and 1 Serein message' in sidebar()
+        assert 'Removes 1 node' in sidebar() and 'and 1 AnLe message' in sidebar()
         assert 'Codex sessions/repos stay' in sidebar()
         send(b'\x1b')
         until(lambda: 'DELETE WORKSPACE' not in sidebar(), 'workspace deletion did not cancel')
@@ -345,9 +389,20 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'DELETE WORKSPACE' in sidebar() and 'Creates an empty workspace' in sidebar() and 'Y delete' in sidebar(), 'last-workspace confirmation did not explain the replacement')
         send(b'y')
         until(lambda: db.execute('SELECT name FROM spaces').fetchall() == [('New Workspace',)], 'empty replacement workspace was not created')
-        until(lambda: 'New Workspace' in sidebar(), 'replacement workspace did not appear')
-        until(lambda: 'No messages for you yet.' in native_screen() and '▄█████████▄' in native_screen(), 'empty inbox did not show the pixel dog')
-        assert '█▀▄    ▄▀█' not in native_screen()
+        until(lambda: selected('human') and 'DELETE WORKSPACE' not in sidebar(), 'replacement workspace did not appear')
+        assert 'New Workspace' not in sidebar(), 'workspace name should not appear below the wordmark'
+        until(lambda: 'No messages for you yet.' in native_screen() and dogs_visible(), 'short empty inbox did not show An and Le')
+        # A taller terminal shows the full pair without speech bubbles.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 208, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '30' and dogs_visible() and 'No messages for you yet.' in native_screen(), 'full empty inbox did not show An and Le')
+        assert '█▀▀▀▀▀█        █▀▀▀▀▀█' not in native_screen(), 'speech bubbles should not appear above the dogs'
+        colored_pet = tmux('capture-pane', '-p', '-e', '-t', native_pane())
+        assert '\x1b[38;5;' in colored_pet and '\x1b[48;5;' in colored_pet, 'the pixel pets did not retain their colors'
+        # A narrow pane keeps both dogs and the caption visible.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 64, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and dogs_visible() and 'No messages for you yet.' in native_screen(), 'narrow inbox did not show the dogs and caption')
         if os.environ.get('SEREIN_SIDEBAR_DUMP'):
             print(native_screen(), flush=True)
         assert db.execute('SELECT COUNT(*) FROM messages').fetchone()[0] == 0
