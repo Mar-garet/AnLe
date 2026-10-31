@@ -12,6 +12,13 @@ function fixture(t) {
   return store;
 }
 
+test('rejects duplicate workspace names with a useful message', t => {
+  const store = fixture(t);
+  store.createSpace('Backend');
+  assert.throws(() => store.createSpace('backend'), /Workspace name already exists/);
+  assert.equal(store.spaces().length, 2);
+});
+
 test('deleting a workspace removes its data without affecting another workspace', t => {
   const store = fixture(t);
   const other = store.createSpace('Other');

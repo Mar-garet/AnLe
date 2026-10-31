@@ -16,7 +16,7 @@ import {ensureReviewerPair, prepareReadOnlySession, prepareReviewer, queueToRevi
 import {HUMAN, Store} from './store.js';
 import {introduce, replyMessage, sendMessage} from './messaging.js';
 import {MouseSequenceParser, positionForScrollbarRow, scrollbarGeometry} from './scroll.js';
-import {COMPACT_CONTENT_TOP, COMPACT_PICKER_TOP, compactContentRows, compactNodeAt, sidebarNodeWindow} from './sidebar.js';
+import {COMPACT_CONTENT_TOP, COMPACT_PICKER_TOP, compactContentRows, compactNodeAt, sidebarNodeWindow, workspaceNodes} from './sidebar.js';
 import {integrationStatus, setupIntegration} from './setup.js';
 
 const h = React.createElement;
@@ -86,7 +86,11 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [size, setSize] = useState({columns: stdout.columns || 100, rows: stdout.rows || 30});
   const [spaces, setSpaces] = useState(() => store.spaces());
   const [spaceId, setSpaceId] = useState(() => initialSpaceId || store.spaces()[0].id);
+  const activeSpaceId = useRef(spaceId);
   const [members, setMembers] = useState([]);
+  const [workspaceMembers, setWorkspaceMembers] = useState([]);
+  const [collapsedSpaces, setCollapsedSpaces] = useState(() => new Set());
+  const [workspaceSelected, setWorkspaceSelected] = useState(false);
   const [reviews, setReviews] = useState([]);
   const [reviewerPairs, setReviewerPairs] = useState([]);
   const [reviewerIds, setReviewerIds] = useState([]);
@@ -147,10 +151,12 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const sessionThreadId = view === 'node' && selection > 0 ? selected?.thread_id : null;
   const membersByThread = useMemo(() => new Map(members.map(member => [member.thread_id, member])), [members]);
   const reviewerIdSet = useMemo(() => new Set(reviewerIds), [reviewerIds]);
-  const sidebarMembers = useMemo(() => {
-    const threadPaths = new Map(threads.map(thread => [thread.id, thread.cwd]));
-    return members.map(member => ({...member, cwd: member.cwd || threadPaths.get(member.thread_id) || '', is_reviewer: reviewerIdSet.has(member.thread_id)}));
-  }, [members, threads, reviewerIdSet]);
+  const threadPaths = useMemo(() => new Map(threads.map(thread => [thread.id, thread.cwd])), [threads]);
+  const treeNodes = useMemo(() => workspaceNodes(spaces, workspaceMembers, {collapsed: collapsedSpaces, paths: threadPaths, reviewerIds: reviewerIdSet}),
+    [spaces, workspaceMembers, collapsedSpaces, threadPaths, reviewerIdSet]);
+  const treeSelection = Math.max(0, treeNodes.findIndex(node => workspaceSelected
+    ? node.kind === 'workspace' && node.space_id === spaceId
+    : selection > 0 ? node.kind === 'member' && node.space_id === spaceId && node.thread_id === selectedMember?.thread_id : node.kind === 'human'));
   const selectedMessage = conversationList ? null : mode === 'detail' ? detailMessage : focus !== 'nodes' && !sessionThreadId ? contentMessages[messageSelection] : null;
   const replyMember = selectedMessage?.recipient_id === HUMAN ?
     (selectedMessage.space_id === space.id ? membersByThread.get(selectedMessage.sender_id) : store.member(selectedMessage.space_id, selectedMessage.sender_id)) : null;
@@ -214,23 +220,30 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     };
   }), [candidates, membersByThread, reviewerIdSet]);
 
-  const refreshStore = useCallback(() => {
+  const refreshStore = useCallback((targetSpaceId = activeSpaceId.current) => {
     if (!inboxOnly && !activityOnly && Date.now() - lastDeliveryRecovery.current >= 30000) {
       store.recoverStaleDeliveries();
       lastDeliveryRecovery.current = Date.now();
     }
     setSpaces(store.spaces());
-    setMembers(store.members(spaceId));
+    if (inboxOnly || activityOnly) setMembers(store.members(targetSpaceId));
+    else {
+      const all = store.allMembers();
+      setWorkspaceMembers(all);
+      setMembers(all.filter(member => member.space_id === targetSpaceId));
+    }
     if (!inboxOnly && !activityOnly) {
-      setReviews(store.reviews(spaceId).map(review => ({...review, snapshot_path: store.reviewRounds(review.id).at(-1)?.snapshot_path || null})));
-      setReviewerPairs(store.reviewerPairs(spaceId));
+      setReviews(store.reviews(targetSpaceId).map(review => ({...review, snapshot_path: store.reviewRounds(review.id).at(-1)?.snapshot_path || null})));
+      setReviewerPairs(store.reviewerPairs(targetSpaceId));
       setReviewerIds(store.reviewerThreadIds());
     }
-    setMessages(store.messages(spaceId, null));
+    setMessages(store.messages(targetSpaceId, null));
     setHumanMessages(store.humanInbox());
     setDesktopNotifications(store.desktopNotificationsEnabled());
     setStoreReady(true);
-  }, [store, spaceId, inboxOnly, activityOnly]);
+  }, [store, inboxOnly, activityOnly]);
+
+  function switchSpace(id) { activeSpaceId.current = id; setSpaceId(id); }
 
   const refreshThreads = useCallback(async () => {
     if (!client) return;
@@ -298,7 +311,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   }, [refreshThreads, refreshIntegration]);
 
   useEffect(() => { if (selection > members.length) setSelection(members.length); }, [selection, members.length]);
-  useEffect(() => { setSidebarScroll(0); }, [selection, spaceId, size.columns, size.rows]);
+  useEffect(() => { setSidebarScroll(0); }, [selection, workspaceSelected, spaceId, size.columns, size.rows]);
   useEffect(() => { setPickerScroll(0); }, [pickerSelection, pickerQuery, mode, size.columns, size.rows]);
   useEffect(() => { if (messageSelection >= contentMessages.length) setMessageSelection(Math.max(0, contentMessages.length - 1)); }, [messageSelection, contentMessages.length]);
   useEffect(() => {
@@ -434,7 +447,8 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         const targetMembers = store.members(request.space_id);
         const index = request.thread_id === HUMAN ? -1 : targetMembers.findIndex(member => member.thread_id === request.thread_id);
         if (!targetSpace || (request.thread_id !== HUMAN && index < 0)) throw new Error('Participant is no longer in this workspace');
-        setSpaces(store.spaces()); setMembers(targetMembers); setSpaceId(request.space_id); setSelection(index + 1);
+        switchSpace(request.space_id); refreshStore(request.space_id); setSelection(index + 1); setWorkspaceSelected(false);
+        setCollapsedSpaces(current => { const next = new Set(current); next.delete(request.space_id); return next; });
         setView('node'); setMode('normal'); setFocus('nodes');
         if (request.thread_id === HUMAN) await nativeManager.focusInbox(request.space_id);
         else {
@@ -448,11 +462,38 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     const timer = setInterval(poll, 300);
     void poll();
     return () => { cancelled = true; clearInterval(timer); };
-  }, [store, nativeManager, client]);
+  }, [store, nativeManager, client, refreshStore]);
 
   function prompt(nextMode, value = '') { setInput(value); setMode(nextMode); }
-  function finish() { setMode('normal'); setInput(''); setDraft(null); refreshStore(); }
+  function finish(targetSpaceId = spaceId) { setMode('normal'); setInput(''); setDraft(null); refreshStore(targetSpaceId); }
   function run(task) { Promise.resolve().then(task).catch(error => setNotice(error.message || String(error))).finally(refreshStore); }
+  function setWorkspaceExpanded(id, expanded) {
+    setCollapsedSpaces(current => {
+      const next = new Set(current);
+      if (expanded) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  function selectTreeNode(node) {
+    if (!node) return;
+    setView('node'); setFocus('nodes');
+    if (node.kind === 'human') {
+      setWorkspaceSelected(false); setSelection(0);
+      return;
+    }
+    const target = store.space(node.space_id);
+    if (!target) { setNotice('Workspace no longer exists.'); refreshStore(); return; }
+    const targetMembers = target.id === spaceId ? members : store.members(target.id);
+    const index = node.kind === 'member' ? targetMembers.findIndex(member => member.thread_id === node.thread_id) : -1;
+    if (node.kind === 'member' && index < 0) { setNotice('Session no longer belongs to this workspace.'); refreshStore(); return; }
+    if (target.id !== spaceId) { switchSpace(target.id); refreshStore(target.id); }
+    setWorkspaceSelected(node.kind === 'workspace');
+    setSelection(index + 1);
+    if (node.kind === 'workspace') setNotice(`Workspace: ${target.name}`);
+  }
+  function moveTreeSelection(amount) {
+    selectTreeNode(treeNodes[Math.max(0, Math.min(treeNodes.length - 1, treeSelection + amount))]);
+  }
   async function introduceMember(currentSpace, currentMember, {force = false} = {}) {
     const owner = store.pairForReviewer(currentSpace.id, currentMember.thread_id);
     if (owner) {
@@ -540,8 +581,9 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       const targetMembers = store.members(message.space_id);
       const index = threadId === HUMAN ? -1 : targetMembers.findIndex(member => member.thread_id === threadId);
       if (threadId !== HUMAN && index < 0) throw new Error('Participant is no longer in this workspace');
-      setSpaces(store.spaces()); setMembers(targetMembers); setSpaceId(message.space_id);
-      setSelection(index + 1); setView('node'); setMode('normal'); setFocus(threadId === HUMAN ? 'messages' : 'nodes');
+      switchSpace(message.space_id); refreshStore(message.space_id);
+      setSelection(index + 1); setWorkspaceSelected(false); setWorkspaceExpanded(message.space_id, true);
+      setView('node'); setMode('normal'); setFocus(threadId === HUMAN ? 'messages' : 'nodes');
     } catch (error) { setNotice(error.message || String(error)); }
   }
 
@@ -607,7 +649,9 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     try {
       if (mode === 'new-space') {
         const created = store.createSpace(value);
-        setSpaceId(created.id); setSelection(0); setNotice(`Created workspace: ${created.name}`); finish();
+        switchSpace(created.id); setSelection(0); setWorkspaceSelected(true); setView('node'); setFocus('nodes');
+        setConversationMode(false); setConversationId(null); setMessageSelection(0); setDetailMessageId(null);
+        setNotice(`Created workspace: ${created.name}`); finish(created.id);
       } else if (mode === 'picker-search') {
         setPickerQuery(value); setPickerSelection(0); setMode('picker'); setInput('');
       } else if (mode === 'join-name') {
@@ -615,7 +659,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         setDraft({...draft, name: value}); prompt('join-role');
       } else if (mode === 'join-role') {
         const member = store.addMember(space.id, {threadId: draft.thread.id, name: draft.name, role: value, cwd: draft.thread.cwd || ''});
-        finish(); setSelection(members.length + 1); setNotice(`Creating ${member.name} CR…`);
+        finish(); setSelection(members.length + 1); setWorkspaceSelected(false); setWorkspaceExpanded(space.id, true); setNotice(`Creating ${member.name} CR…`);
         run(async () => { await introduceMember(space, member); await refreshThreads(); setNotice(`${member.name} and its CR joined. Introduction queued.`); });
       } else if (mode === 'edit-name') {
         if (!value) throw new Error('Node name cannot be empty');
@@ -759,7 +803,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     }
     if (mode === 'confirm-remove') {
       if (keyInput.toLowerCase() === 'y' && selected && selection > 0) {
-        store.removeMember(space.id, selected.thread_id); setNotice(`${selected.name} removed from the workspace.`); setSelection(0); refreshStore();
+        store.removeMember(space.id, selected.thread_id); setNotice(`${selected.name} removed from the workspace.`); setSelection(0); setWorkspaceSelected(true); refreshStore();
       }
       setMode('normal'); setDraft(null); return;
     }
@@ -768,7 +812,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       if (keyInput.toLowerCase() === 'y') {
         try {
           const {deleted, nextSpace, replacementCreated} = store.deleteSpace(draft.spaceId);
-          setSpaces(store.spaces()); setSpaceId(nextSpace.id); setSelection(0); setView('node'); setFocus('nodes');
+          switchSpace(nextSpace.id); refreshStore(nextSpace.id); setSelection(0); setWorkspaceSelected(true); setWorkspaceExpanded(nextSpace.id, true); setView('node'); setFocus('nodes');
           setMessageSelection(0); setDetailMessageId(null);
           setInlineDrafts(current => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${deleted.id}:`))));
           setNotice(replacementCreated ? 'Workspace deleted. An empty workspace was created.' : `Workspace deleted: ${deleted.name}`);
@@ -808,7 +852,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     }
     if (command('n')) {
       setMode('normal');
-      setSelection(0); setView('node'); setFocus(nativeManager ? 'nodes' : 'messages');
+      setSelection(0); setWorkspaceSelected(false); setView('node'); setFocus(nativeManager ? 'nodes' : 'messages');
       if (!nativeManager) selectNewestInbox();
       if (nativeManager) nativeManager.focusInbox(space.id, {selectNewest: true}).catch(error => setNotice(error.message || String(error)));
       return;
@@ -856,7 +900,10 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     if ((key.ctrl && keyInput === 'w') || (!nativeManager && !composeTarget && mode === 'normal' && keyInput === 'G')) { prompt('new-space'); return; }
     if (command('g')) {
       const index = spaces.findIndex(item => item.id === spaceId);
-      setSpaceId(spaces[(index + 1) % spaces.length].id); setSelection(0); setView('node'); setFocus('nodes'); setMode('normal');
+      const nextSpace = spaces[(index + 1) % spaces.length];
+      switchSpace(nextSpace.id); setSelection(0); setWorkspaceSelected(true); setWorkspaceExpanded(nextSpace.id, true); setView('node'); setFocus('nodes'); setMode('normal');
+      setConversationMode(false); setConversationId(null); setMessageSelection(0); setDetailMessageId(null);
+      refreshStore(nextSpace.id); setNotice(`Workspace: ${nextSpace.name}`);
       return;
     }
     if (key.ctrl && keyInput.toLowerCase() === 'y' && view === 'node') {
@@ -897,11 +944,16 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       else { refreshThreads(); refreshIntegration(); setNotice('Refreshed.'); }
       return;
     }
+    if (workspaceSelected && focus === 'nodes' && mode === 'normal' && view === 'node') {
+      if (key.return) { setWorkspaceExpanded(spaceId, collapsedSpaces.has(spaceId)); return; }
+      if (key.leftArrow) { setWorkspaceExpanded(spaceId, false); return; }
+      if (key.rightArrow) { setWorkspaceExpanded(spaceId, true); return; }
+    }
     if (nativeManager && mode === 'normal' && view === 'activity' && (key.return || key.tab)) {
       nativeManager.focusActivity(space.id).catch(error => setNotice(error.message || String(error)));
       return;
     }
-    if (nativeManager && mode === 'normal' && view === 'node' && selection === 0 && focus === 'nodes') {
+    if (nativeManager && mode === 'normal' && view === 'node' && selection === 0 && !workspaceSelected && focus === 'nodes') {
       if (key.return || key.tab) { nativeManager.focusInbox(space.id).catch(error => setNotice(error.message || String(error))); return; }
       if (!key.ctrl && !key.meta && keyInput) { nativeManager.forwardInbox(space.id, keyInput).catch(error => setNotice(error.message || String(error))); return; }
     }
@@ -961,16 +1013,15 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         if (key.return && contentMessages[messageSelection]) openMessage(contentMessages[messageSelection]);
       }
     } else {
-      if (key.upArrow) { setView('node'); setSelection(value => Math.max(0, value - 1)); }
-      if (key.downArrow) { setView('node'); setSelection(value => Math.min(members.length, value + 1)); }
+      if (key.upArrow) moveTreeSelection(-1);
+      if (key.downArrow) moveTreeSelection(1);
       if (key.pageUp || key.pageDown) {
-        const nodes = [{name: 'human', thread_id: HUMAN}, ...sidebarMembers];
         const rowCapacity = nativeManager ? compactContentRows(size.rows) : Math.max(1, panelHeight - 5);
         const innerWidth = nativeManager ? Math.max(8, size.columns - 4) : sidebarWidth - 4;
         const indent = nativeManager ? 2 : 4;
         setView('node');
         setSidebarScroll(value => {
-          const window = sidebarNodeWindow({nodes, selection, innerWidth, rowCapacity, indent, scrollShift: value});
+          const window = sidebarNodeWindow({nodes: treeNodes, selection: treeSelection, innerWidth, rowCapacity, indent, scrollShift: value});
           const next = Math.max(0, Math.min(window.scrollLimit, window.start + (key.pageDown ? rowCapacity - 1 : 1 - rowCapacity)));
           return value + next - window.start;
         });
@@ -1041,13 +1092,14 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       const showingNodes = view === 'activity' || (view === 'node' && (selection > 0 || focus === 'nodes'));
       if (showingNodes) {
         if (wheel !== null) {
-          setFocus('nodes'); setView('node');
-          setSelection(value => Math.max(0, Math.min(members.length, value + direction)));
+          moveTreeSelection(direction);
         } else if (click) {
-          setFocus('nodes'); setView('node');
-          const nodes = [{name: 'human / inbox', thread_id: HUMAN}, ...sidebarMembers];
-          const index = compactNodeAt({x: event.x, y: event.y, width: size.columns, height: size.rows, selection, nodes, scrollShift: sidebarScroll});
-          if (index !== null) setSelection(index);
+          const index = compactNodeAt({x: event.x, y: event.y, width: size.columns, height: size.rows, selection: treeSelection, nodes: treeNodes, scrollShift: sidebarScroll});
+          if (index !== null) {
+            const node = treeNodes[index];
+            selectTreeNode(node);
+            if (node.kind === 'workspace' && event.x <= 6) setWorkspaceExpanded(node.space_id, node.collapsed);
+          }
         }
       } else if (click && event.y < COMPACT_CONTENT_TOP) {
         setView('node'); setFocus('nodes');
@@ -1081,6 +1133,21 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         const {rows} = sidebarNodeWindow({nodes: pickerNodes, selection: pickerSelection, innerWidth: Math.max(1, feedWidth - 4), rowCapacity: Math.max(1, panelHeight - 4), scrollShift: pickerScroll});
         const index = rows[event.y - 8]?.index;
         if (index !== undefined) setPickerSelection(index);
+      }
+      return;
+    }
+    if (mode === 'normal' && size.columns >= 64 && size.rows >= 18 && event.x >= 2 && event.x < sidebarWidth && event.y >= 8 && event.y < 5 + panelHeight - 1) {
+      if (event.release || (event.button & 32)) return;
+      if (event.button & 64) {
+        const direction = event.button & 3;
+        if (direction <= 1) moveTreeSelection(direction ? 1 : -1);
+      } else if ((event.button & 3) === 0) {
+        const {rows} = sidebarNodeWindow({nodes: treeNodes, selection: treeSelection, innerWidth: sidebarWidth - 4, rowCapacity: panelHeight - 5, indent: 4, scrollShift: sidebarScroll});
+        const node = rows[event.y - 8]?.node;
+        if (node) {
+          selectTreeNode(node);
+          if (node.kind === 'workspace' && event.x <= 8) setWorkspaceExpanded(node.space_id, node.collapsed);
+        }
       }
       return;
     }
@@ -1149,7 +1216,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       T(` ${safeTerminalText(notice).replaceAll('\n', ' ')} · F6 sessions`, C.muted, {wrap: 'truncate-end'}));
   }
   if (nativeManager) {
-    return h(CompactSidebar, {size, selected, members: sidebarMembers, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
+    return h(CompactSidebar, {size, selected, selection, treeNodes, treeSelection, activeSpaceId: spaceId, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
   }
   if (size.columns < 64 || size.rows < 18) {
     return h(Box, {padding: 1, flexDirection: 'column'}, h(Text, {bold: true}, T('An', C.an), T('Le', C.foreground)), T('Resize the terminal to at least 64 × 18. Press Ctrl+Q to quit.', C.muted));
@@ -1158,7 +1225,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   return h(Box, {flexDirection: 'column', width: Math.max(55, size.columns)},
     h(Header, {connection, spaceCount: spaces.length, unreadCount}),
     h(Box, {flexDirection: 'row'},
-      h(Sidebar, {space, members: sidebarMembers, selectedIndex: selection, sidebarScroll, statusMap, unreadCount, attentionCount, width: sidebarWidth, height: panelHeight}),
+      h(Sidebar, {treeNodes, treeSelection, activeSpaceId: spaceId, sidebarScroll, statusMap, unreadCount, attentionCount, width: sidebarWidth, height: panelHeight}),
       h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
     ),
     h(Box, {paddingX: 1}, T('◆ ', C.yellow), T(notice, C.muted, {wrap: 'truncate-end'})),
@@ -1212,7 +1279,29 @@ function renderHelpRows(lines) {
     T(shortcut.padEnd(8), C.purple, {bold: true}), T(description, C.foreground)));
 }
 
-function CompactSidebar({size, selected, members, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, composeTarget, inlineDraft, sending}) {
+function renderWorkspaceRows(rows, selection, {activeSpaceId, statusMap, unreadCount, attentionCount, indent = 2}) {
+  const base = ' '.repeat(Math.max(0, indent - 2));
+  return rows.map(({node, index, type, text, part}) => {
+    const active = index === selection;
+    const key = `${node.kind}:${node.space_id || ''}:${node.thread_id || ''}:${type}:${part}`;
+    if (node.kind === 'workspace') {
+      const current = node.space_id === activeSpaceId;
+      return h(Box, {key},
+        T(`${base}${active ? '▸ ' : '  '}`, active ? C.purple : C.muted),
+        T(node.collapsed ? '▸ ' : '▾ ', C.purple),
+        h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(safeTerminalText(node.name).replaceAll('\n', ' '), current ? C.purple : C.foreground, {bold: current || active, wrap: 'truncate-end'})),
+        h(Box, {marginLeft: 1, flexShrink: 0}, T(String(node.count), current ? C.purple : C.muted)));
+    }
+    if (type === 'path') return h(Text, {key, wrap: 'truncate-end'}, T(`${base}  │ `, C.muted), T(text, node.cwd ? active ? selectedNodeColor(node) : C.path : C.muted, {bold: active && !!node.cwd}));
+    const state = node.kind === 'human' ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
+    return h(Box, {key},
+      T(`${base}${node.kind === 'member' ? '  │ ' : ''}${active ? '▸ ' : '  '}`, active ? selectedNodeColor(node) : C.muted),
+      h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(safeTerminalText(node.name).replaceAll('\n', ' '), active ? selectedNodeColor(node) : C.foreground, {bold: active, wrap: 'truncate-end'})),
+      h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, active, selectedNodeColor(node)))));
+  });
+}
+
+function CompactSidebar({size, selected, selection, treeNodes, treeSelection, activeSpaceId, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, composeTarget, inlineDraft, sending}) {
   const width = Math.max(20, size.columns);
   const height = Math.max(10, size.rows);
   const innerWidth = Math.max(8, width - 4);
@@ -1280,17 +1369,9 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
         T(`  ${safeTerminalText(message.body).replaceAll('\n', ' ')}`, C.foreground, {wrap: 'truncate-end'}))),
       contentMessages.length === 0 ? T('No messages yet.', C.muted, {key: 'empty'}) : null];
   } else {
-    const nodes = [{name: 'human / inbox', thread_id: HUMAN}, ...members];
-    const {rows, total} = sidebarNodeWindow({nodes, selection, innerWidth, rowCapacity: room, scrollShift: sidebarScroll});
+    const {rows, total} = sidebarNodeWindow({nodes: treeNodes, selection: treeSelection, innerWidth, rowCapacity: room, scrollShift: sidebarScroll});
     nodeOverflow = total > room;
-    body = rows.map(({node, index, type, text, part}) => {
-      const active = index === selection;
-      if (type === 'path') return T(`  ${text}`, node.cwd ? active ? selectedNodeColor(node) : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: active && !!node.cwd, wrap: 'truncate-end'});
-      const state = node.thread_id === HUMAN ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
-      return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', active ? selectedNodeColor(node) : C.muted)),
-        h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? selectedNodeColor(node) : C.foreground, {bold: active, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, active, selectedNodeColor(node)))));
-    });
+    body = renderWorkspaceRows(rows, treeSelection, {activeSpaceId, statusMap, unreadCount, attentionCount});
   }
   const editor = showEditor ? h(Box, {height: 2, flexDirection: 'column', key: 'editor'},
     T(inlineDraft.text ? `› ${safeTerminalText(draftViewport(inlineDraft, Math.max(1, innerWidth - 2)))}` : '› Type reply… ▌', C.foreground, {wrap: 'truncate-end'}),
@@ -1301,7 +1382,7 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
     h(AnLeBrand, {width: innerWidth, separator: true}),
     h(Box, {flexGrow: 1, flexShrink: 1, flexDirection: 'column', overflow: 'hidden'}, ...visibleBody), editor,
     T(view === 'activity' ? 'Activity · ^V return · Enter' : safeTerminalText(notice).replaceAll('\n', ' '), C.muted, {wrap: 'truncate-end'}),
-    T(mode === 'help' ? 'PgUp/PgDn page' : nodeOverflow ? '↑↓ select · Pg scroll' : '↑↓ select · Enter open', C.muted, {wrap: 'truncate-end'}),
+    T(mode === 'help' ? 'PgUp/PgDn page' : mode === 'normal' && treeNodes[treeSelection]?.kind === 'workspace' ? (nodeOverflow ? 'Enter toggle · Pg scroll' : 'Enter / ←→ toggle') : nodeOverflow ? '↑↓ select · Pg scroll' : '↑↓ select · Enter open', C.muted, {wrap: 'truncate-end'}),
     h(Box, {overflow: 'hidden'}, T('^A', C.purple, {bold: true}), T(' add  ', C.muted), T('^N', C.purple, {bold: true}), T(' inbox  ', C.muted), T('^P', C.purple, {bold: true}), T(' help', C.muted)));
 }
 
@@ -1316,26 +1397,12 @@ function Header({connection, spaceCount, unreadCount}) {
     ));
 }
 
-function Sidebar({space, members, selectedIndex, sidebarScroll, statusMap, unreadCount, attentionCount, width, height}) {
-  const nodes = [{name: 'human', thread_id: HUMAN, role: 'You'}, ...members];
-  const {rows} = sidebarNodeWindow({nodes, selection: selectedIndex, innerWidth: width - 4, rowCapacity: height - 5, indent: 4, scrollShift: sidebarScroll});
+function Sidebar({treeNodes, treeSelection, activeSpaceId, sidebarScroll, statusMap, unreadCount, attentionCount, width, height}) {
+  const {rows} = sidebarNodeWindow({nodes: treeNodes, selection: treeSelection, innerWidth: width - 4, rowCapacity: height - 5, indent: 4, scrollShift: sidebarScroll});
   return h(Box, {width, height, borderStyle: PIXEL_BORDER, borderColor: C.purple, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
-    T('■  WORKSPACE', C.purple, {bold: true}),
-    T(space?.name || '', C.foreground, {wrap: 'truncate-end'}),
+    T('■  WORKSPACES', C.purple, {bold: true}),
     T('─'.repeat(Math.max(4, width - 4)), C.muted),
-    ...rows.map(({node, index, type, text, part}) => {
-      const selected = index === selectedIndex;
-      if (type === 'path') return T(`    ${text}`, node.cwd ? selected ? selectedNodeColor(node) : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: selected && !!node.cwd, wrap: 'truncate-end'});
-      const state = node.thread_id === HUMAN ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
-      return h(Box, {key: `${node.thread_id}:name`},
-        h(Box, {width: 4, flexShrink: 0},
-          T(selected ? '▸' : ' ', selected ? selectedNodeColor(node) : C.muted),
-          T(` ${node.thread_id === HUMAN ? '▧' : '▣'} `, C.foreground, {bold: selected})),
-        h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'},
-          T(node.name, selected ? selectedNodeColor(node) : C.foreground, {bold: selected, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, selected, selectedNodeColor(node)))));
-    }),
-    members.length === 0 ? T('  Ctrl+A: add session', C.muted, {wrap: 'truncate-end'}) : null,
+    ...renderWorkspaceRows(rows, treeSelection, {activeSpaceId, statusMap, unreadCount, attentionCount, indent: 4}),
   );
 }
 

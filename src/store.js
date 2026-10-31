@@ -256,7 +256,11 @@ export class Store {
   createSpace(name) {
     name = requiredText(name, 'Workspace name', 80);
     const id = randomUUID();
-    this.db.prepare('INSERT INTO spaces VALUES (?, ?, ?)').run(id, name, now());
+    try { this.db.prepare('INSERT INTO spaces VALUES (?, ?, ?)').run(id, name, now()); }
+    catch (error) {
+      if (/UNIQUE constraint failed: spaces\.name/i.test(error.message || '')) throw new Error('Workspace name already exists');
+      throw error;
+    }
     return this.space(id);
   }
 
@@ -287,6 +291,10 @@ export class Store {
 
   members(spaceId) {
     return this.db.prepare(`SELECT ${memberFields} ${memberJoins} WHERE m.space_id = ? ORDER BY m.rowid`).all(spaceId);
+  }
+
+  allMembers() {
+    return this.db.prepare(`SELECT ${memberFields} ${memberJoins} ORDER BY m.rowid`).all();
   }
 
   member(spaceId, value) {

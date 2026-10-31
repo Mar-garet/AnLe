@@ -10,6 +10,23 @@ export function compactContentRows(height) {
   return Math.max(1, Math.max(10, height) - 9);
 }
 
+export function workspaceNodes(spaces, members, {collapsed = new Set(), paths = new Map(), reviewerIds = new Set()} = {}) {
+  const bySpace = new Map();
+  for (const member of members) {
+    if (!bySpace.has(member.space_id)) bySpace.set(member.space_id, []);
+    bySpace.get(member.space_id).push(member);
+  }
+  const nodes = [{kind: 'human', name: 'human / inbox', thread_id: 'human'}];
+  for (const space of spaces) {
+    const items = bySpace.get(space.id) || [];
+    nodes.push({kind: 'workspace', space_id: space.id, name: space.name, collapsed: collapsed.has(space.id), count: items.length});
+    if (!collapsed.has(space.id)) {
+      for (const member of items) nodes.push({...member, kind: 'member', cwd: member.cwd || paths.get(member.thread_id) || '', is_reviewer: reviewerIds.has(member.thread_id)});
+    }
+  }
+  return nodes;
+}
+
 export function directoryLines(cwd, width) {
   const path = cwd ? safeTerminalText(cwd).replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t') : 'Directory unavailable';
   const limit = Math.max(1, width);
@@ -30,8 +47,9 @@ export function directoryLines(cwd, width) {
 export function sidebarNodeWindow({nodes, selection, innerWidth, rowCapacity, indent = 2, scrollShift = 0}) {
   const rows = [];
   for (const [index, node] of nodes.entries()) {
-    if (node.thread_id !== 'human') {
-      directoryLines(node.cwd, innerWidth - indent).forEach((text, part) => rows.push({index, node, type: 'path', text, part}));
+    if (node.kind !== 'workspace' && node.thread_id !== 'human') {
+      const pathIndent = indent + (node.kind === 'member' ? 2 : 0);
+      directoryLines(node.cwd, innerWidth - pathIndent).forEach((text, part) => rows.push({index, node, type: 'path', text, part}));
     }
     rows.push({index, node, type: 'name', part: 0});
   }

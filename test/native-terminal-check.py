@@ -187,6 +187,12 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
             os.write(master, data)
             drain(master, .1)
 
+        def click_sidebar(text, occurrence=0):
+            lines = sidebar().splitlines()
+            matches = [index for index, line in enumerate(lines) if text in line]
+            index = matches[occurrence]
+            send(f'\x1b[<0;8;{index + 1}M\x1b[<0;8;{index + 1}m'.encode())
+
         def click_message(body):
             lines = native_screen().splitlines()
             index = next(index for index, line in enumerate(lines) if body in line)
@@ -206,7 +212,8 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         assert 'serein' not in brand_header.lower(), 'the old brand still appeared in the sidebar'
         if os.environ.get('SEREIN_SIDEBAR_DUMP'):
             print(sidebar(), flush=True)
-        assert sidebar().count('/tmp/backend') == 2
+        assert sidebar().count('/tmp/backend') == 3
+        assert sidebar().index('My Workspace') < sidebar().index('frontend') < sidebar().index('Second Workspace')
         lines = sidebar().splitlines()
         frontend_name = next(i for i, line in enumerate(lines) if 'frontend' in line and '/tmp/frontend' not in line)
         assert '/tmp/frontend' in lines[frontend_name - 1], 'directory must appear above its session name'
@@ -219,6 +226,43 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         assert len(parts) > 1 and ''.join(parts) == long_path
         until(lambda: tmux('display-message', '-p', '-t', left, '#{mouse_any_flag}') == '1', 'sidebar did not enable mouse reporting')
         until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen() and 'Reply to backend' in native_screen(), 'human inbox and reply input did not render')
+        # Create from Activity: the new workspace must be selected, visible,
+        # and empty, while the global inbox still shows messages from all spaces.
+        send(b'\x16')
+        until(lambda: 'ACTIVITY' in native_screen(), 'activity did not open before workspace creation')
+        send(b'\x17')
+        until(lambda: 'WORKSPACE NAME' in sidebar(), 'workspace creation prompt did not appear')
+        send(b'Experimental')
+        send(b'\r')
+        until(lambda: '▸ ▾ Experimental' in sidebar() and 'YOUR INBOX' in native_screen(), 'new workspace was not selected after creation from Activity')
+        check_db = sqlite3.connect(f'file:{work / "state/serein.sqlite"}?mode=ro', uri=True)
+        new_id = check_db.execute("SELECT id FROM spaces WHERE name='Experimental'").fetchone()[0]
+        assert check_db.execute('SELECT count(*) FROM members WHERE space_id=?', (new_id,)).fetchone()[0] == 0
+        until(lambda: 'Need your decision' in native_screen(), 'the global inbox changed when creating a workspace')
+        send(b'\x04')
+        until(lambda: 'DELETE WORKSPACE' in sidebar() and 'Experimental' in sidebar(), 'the new workspace was not the active workspace')
+        send(b'y')
+        until(lambda: check_db.execute('SELECT count(*) FROM spaces WHERE id=?', (new_id,)).fetchone()[0] == 0, 'temporary workspace was not removed')
+        check_db.close()
+        until(lambda: '▸ ▾ My Workspace' in sidebar(), 'deleting the temporary workspace did not select the original workspace')
+        # Each workspace is navigable as a parent, including with a session
+        # shared with another workspace, and can be folded independently.
+        click_sidebar('Second Workspace')
+        until(lambda: '▸ ▾ Second Workspace' in sidebar(), 'clicking another workspace did not select it')
+        send(b'\r')
+        until(lambda: '▸ ▸ Second Workspace' in sidebar() and sidebar().count('/tmp/backend') == 2, 'workspace did not collapse')
+        send(b'\x1b[C')
+        until(lambda: '▸ ▾ Second Workspace' in sidebar() and sidebar().count('/tmp/backend') == 3, 'workspace did not expand')
+        send(b'\x1b[B')
+        until(lambda: selected('backend') and 'FAKE CODEX mock-backend' in native_screen(), 'session in the second workspace did not open')
+        send(b'\x04')
+        until(lambda: 'DELETE WORKSPACE' in sidebar() and 'Second Workspace' in sidebar(), 'selecting a session did not activate its workspace')
+        send(b'\x1b')
+        send(b'\x07')
+        until(lambda: '▸ ▾ My Workspace' in sidebar(), 'Ctrl+G did not switch workspace groups')
+        send(b'\x0e')
+        until(lambda: selected('human') and 'YOUR INBOX' in native_screen(), 'global inbox did not remain accessible')
+        send(b'\x1b[17~')
         send(b'\x14')
         until(lambda: 'YOUR INBOX · OPEN' in native_screen(), 'Ctrl+T from the sidebar did not filter the inbox')
         send(b'\x14')
@@ -349,6 +393,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         send(b'\x1b')
         until(lambda: selected('human'), 'fallback picker did not close')
         send(b'\x1b[B')
+        send(b'\x1b[B')
         until(lambda: selected('frontend'), 'down did not select frontend')
         colored = tmux('capture-pane', '-p', '-e', '-t', left).splitlines()
         front_path = next(line for line in colored if '/tmp/frontend' in line)
@@ -372,7 +417,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         send(b'unsent draft')
         until(lambda: 'unsent draft' in native_screen(), 'native pane did not receive typing')
         # A click from the native pane selects both the sidebar and the clicked node.
-        send(b'\x1b[<0;8;9M\x1b[<0;8;9m')
+        click_sidebar('/tmp/backend')
         until(lambda: selected('backend'), 'click did not select backend')
         until(lambda: 'FAKE CODEX mock-backend' in native_screen(), 'backend native pane did not open after clicking')
         assert tmux('display-message', '-p', '-t', 'workspace:0', '#{pane_id}') == left
@@ -387,7 +432,8 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: selected('frontend'), 'up did not select frontend after clicking')
         until(lambda: native_pane() == frontend_pane and 'unsent draft' in native_screen(), 'native draft did not survive switching')
         # Mouse dragging and the wheel must not trap keys in tmux copy mode.
-        send(b'\x1b[<0;8;7M\x1b[<32;8;8M\x1b[<0;8;8m')
+        path_y = next(i for i, line in enumerate(sidebar().splitlines(), 1) if '/tmp/frontend' in line)
+        send(f'\x1b[<0;8;{path_y}M\x1b[<32;8;{path_y + 1}M\x1b[<0;8;{path_y + 1}m'.encode())
         assert tmux('display-message', '-p', '-t', left, '#{pane_in_mode}') == '0'
         send(b'\x1b[B')
         until(lambda: selected('backend'), 'down stopped working after mouse drag')
@@ -489,7 +535,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen(), 'inbox did not return after widening the pane')
         # Return to the sidebar, click human and type directly without another shortcut.
         send(b'\x1b[17~')
-        send(b'\x1b[<0;8;7M\x1b[<0;8;7m')
+        click_sidebar('/tmp/frontend')
         until(lambda: selected('frontend'), 'could not select frontend')
         send(b'\x1b[<0;8;6M\x1b[<0;8;6m')
         until(lambda: selected('human') and 'YOUR INBOX' in native_screen(), 'clicking human did not show the inbox')
@@ -552,6 +598,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'DIRECTORY' in sidebar() and '/tmp/frontend' in sidebar(), 'short agent profile could not scroll to the directory')
         send(b'\x1b')
         send(b'\x1b[A')
+        send(b'\x1b[A')
         until(lambda: selected('human'), 'could not return from the short profile')
         assert 'backend-two' not in sidebar()
         send(b'\x1b[6~')
@@ -578,6 +625,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'human / inbox' in sidebar(), 'session picker did not close after paging')
         # Removing a session does not delete its Codex pane or workspace messages.
         send(b'\x1b[B')
+        send(b'\x1b[B')
         until(lambda: selected('frontend'), 'frontend was not selected for removal')
         send(b'\x18')
         until(lambda: 'REMOVE SESSION' in sidebar() and 'Codex session is kept' in sidebar(), 'session removal confirmation did not appear')
@@ -595,8 +643,8 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'DELETE WORKSPACE' in sidebar() and 'Creates an empty workspace' in sidebar() and 'Y delete' in sidebar(), 'last-workspace confirmation did not explain the replacement')
         send(b'y')
         until(lambda: db.execute('SELECT name FROM spaces').fetchall() == [('New Workspace',)], 'empty replacement workspace was not created')
-        until(lambda: selected('human') and 'DELETE WORKSPACE' not in sidebar(), 'replacement workspace did not appear')
-        assert 'New Workspace' not in sidebar(), 'workspace name should not appear below the wordmark'
+        until(lambda: '▸ ▾ New Workspace' in sidebar() and 'DELETE WORKSPACE' not in sidebar(), 'replacement workspace did not appear')
+        assert 'New Workspace' not in '\n'.join(sidebar().splitlines()[:5]), 'workspace name should not appear below the wordmark'
         until(lambda: 'No messages for you yet.' in native_screen() and dogs_visible(), 'short empty inbox did not show the dogs')
         # The empty state remains small and legible as the terminal grows.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 208, 0, 0))

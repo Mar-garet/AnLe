@@ -172,7 +172,7 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
             return next(item['result'] for item in map(json.loads, result.stdout.splitlines()) if item.get('id') == 2)
 
         until(lambda: 'backend CR' in sidebar() and 'other CR' in sidebar(), 'existing coding sessions did not receive their dedicated CRs')
-        for _ in range(4):
+        for _ in range(5):
             send(b'\x1b[B')
         until(lambda: '▸ other CR' in sidebar(), 'dedicated reviewer did not become selected')
         cr_color = selected_color('other CR')
@@ -334,6 +334,33 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         until(lambda: '▸ mobile' in sidebar(), 'coding session was not selected in picker')
         picker_coding_color = selected_color('mobile')
         assert picker_coding_color and picker_coding_color[2] > picker_coding_color[0], 'selected coding session in picker is not blue'
+        # A coding session can join another workspace and gets a distinct CR;
+        # the original workspace and its review history stay independent.
+        send(b'\x1b')
+        send(b'\x17')
+        until(lambda: 'WORKSPACE NAME' in sidebar(), 'new workspace prompt did not open')
+        send(b'Other Team')
+        send(b'\r')
+        until(lambda: '▸ ▾ Other Team' in sidebar(), 'new workspace was not selected')
+        other_space = db.execute("SELECT id FROM spaces WHERE name='Other Team'").fetchone()[0]
+        send(b'\x01')
+        until(lambda: 'SELECT SESSION' in sidebar(), 'session picker did not open for the new workspace')
+        send(b'/')
+        send(b'dev-1')
+        send(b'\r')
+        until(lambda: '▸ Backend' in sidebar(), 'existing coding session was not available in the new workspace')
+        send(b'\r')
+        until(lambda: 'NAME THIS SESSION' in sidebar(), 'existing session could not be added to the new workspace')
+        send(b'\r')
+        until(lambda: 'ROLE / DESCRIPTION' in sidebar(), 'new workspace member role prompt did not open')
+        send(b'\r')
+        until(lambda: db.execute("SELECT reviewer_id FROM reviewer_pairs WHERE space_id=? AND developer_id='dev-1' AND status='ready'", (other_space,)).fetchone(), 'second workspace did not create its own CR')
+        other_reviewer = db.execute("SELECT reviewer_id FROM reviewer_pairs WHERE space_id=? AND developer_id='dev-1'", (other_space,)).fetchone()[0]
+        assert other_reviewer != reviewer_id
+        assert db.execute("SELECT reviewer_id FROM reviewer_pairs WHERE space_id='default' AND developer_id='dev-1'").fetchone()[0] == reviewer_id
+        sent_other = call_mcp('send_message', {'space_id':other_space, 'to':'Backend CR', 'message':'Review the other workspace.', 'reply_expected':True}, 'dev-1')
+        assert not sent_other.get('isError'), sent_other
+        assert f'--thread\n{other_reviewer}\n' in (work / 'queue.log').read_text(), 'new workspace review was sent to the wrong CR'
     finally:
         if db:
             db.close()
