@@ -71,8 +71,11 @@ export class NativePaneManager {
 
   async ensurePane(member, serverSocket) {
     let pane = this.panes.get(member.thread_id);
+    if (member.review_snapshot_path) {
+      if (!this.prepareReviewer) throw new Error('Cannot confirm the CR session is read-only.');
+      await this.prepareReviewer(member, serverSocket);
+    }
     const command = ['codex', 'resume', member.thread_id, '--remote', `unix://${serverSocket}`];
-    if (member.review_snapshot_path) command.push('--sandbox', 'read-only', '--ask-for-approval', 'never', '--cd', member.review_snapshot_path);
     if (!pane) {
       const args = ['new-window', '-d', '-t', `${this.session}:`, '-P', '-F', '#{pane_id}'];
       const cwd = member.review_snapshot_path || member.cwd;
@@ -137,6 +140,19 @@ export class NativePaneManager {
     await this.tmux(['select-pane', '-t', pane]);
   }
 
+  async forwardPanelShortcut(spaceId, panel, key) {
+    if (!['activity', 'inbox'].includes(panel) || key !== 'C-t') throw new Error('Unsupported panel shortcut');
+    if (panel === 'activity') await this.showActivity(spaceId);
+    else await this.show(null, undefined, spaceId);
+    const pane = panel === 'activity' ? this.activities.get(spaceId) : this.inboxes.get(spaceId);
+    const selected = () => this.desired?.spaceId === spaceId && !this.desired?.member &&
+      !!this.desired?.activity === (panel === 'activity') && pane === this.visiblePane;
+    if (!selected()) throw new Error('The selected workspace changed.');
+    await this.tmux(['send-keys', '-t', pane, key]);
+    if (!selected()) throw new Error('The selected workspace changed.');
+    await this.tmux(['select-pane', '-t', pane]);
+  }
+
   async focusInbox(spaceId, {selectNewest = false} = {}) {
     await this.show(null, undefined, spaceId);
     const pane = this.inboxes.get(spaceId);
@@ -161,6 +177,17 @@ export class NativePaneManager {
     if (this.desired?.member?.thread_id !== member.thread_id) throw new Error('The selected session changed.');
     const pane = this.panes.get(member.thread_id);
     if (pane !== this.visiblePane) throw new Error('The selected session changed.');
+    await this.tmux(['select-pane', '-t', pane]);
+  }
+
+  async forwardSessionShortcut(member, serverSocket, key) {
+    if (key !== 'C-t') throw new Error('Unsupported session shortcut');
+    await this.show(member, serverSocket);
+    const pane = this.panes.get(member.thread_id);
+    const selected = () => this.desired?.member?.thread_id === member.thread_id && pane === this.visiblePane;
+    if (!selected()) throw new Error('The selected session changed.');
+    await this.tmux(['send-keys', '-t', pane, key]);
+    if (!selected()) throw new Error('The selected session changed.');
     await this.tmux(['select-pane', '-t', pane]);
   }
 

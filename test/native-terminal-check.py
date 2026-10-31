@@ -63,14 +63,14 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
     fake_bin = work / 'bin'
     fake_bin.mkdir()
     fake_codex = fake_bin / 'codex'
-    fake_codex.write_text('#!/bin/sh\nif [ "$1" = queue ]; then printf "%s\\n" "$@" >> "$SEREIN_FAKE_LOG"; echo queued; exit 0; fi\nprintf "FAKE CODEX %s\\n" "$2"\nexec cat\n')
+    fake_codex.write_text('#!/bin/sh\nif [ "$1" = queue ]; then printf "%s\\n" "$@" >> "$SEREIN_FAKE_LOG"; echo queued; exit 0; fi\nprintf "FAKE CODEX %s\\n" "$2"\nstty raw -echo\nexec tee -a "$SEREIN_NATIVE_INPUT"\n')
     fake_codex.chmod(0o755)
     server_file = work / 'server.mjs'
     server_file.write_text(SERVER)
     env = {**os.environ, 'CODEX_HOME': str(work / 'codex-home'), 'SEREIN_HOME': str(work / 'state'),
            'SEREIN_CODEX_SOCKET': str(work / 'app.sock'), 'FAKE_SOCKET': str(work / 'app.sock'),
            'FAKE_WS': str(ROOT / 'node_modules/ws/wrapper.mjs'), 'FAKE_MCP': str(ROOT / 'src/mcp-server.js'),
-           'SEREIN_FAKE_LOG': str(work / 'queue.log'),
+           'SEREIN_FAKE_LOG': str(work / 'queue.log'), 'SEREIN_NATIVE_INPUT': str(work / 'native-input.log'),
            'TMUX_TMPDIR': str(tmux_temp), 'TERM': 'xterm-256color', 'FORCE_COLOR': '2',
            'PATH': f'{fake_bin}:{os.environ["PATH"]}'}
     for key in ('TMUX', 'TMUX_PANE', 'SEREIN_UI'):
@@ -219,6 +219,11 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         assert len(parts) > 1 and ''.join(parts) == long_path
         until(lambda: tmux('display-message', '-p', '-t', left, '#{mouse_any_flag}') == '1', 'sidebar did not enable mouse reporting')
         until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen() and 'Reply to backend' in native_screen(), 'human inbox and reply input did not render')
+        send(b'\x14')
+        until(lambda: 'YOUR INBOX · OPEN' in native_screen(), 'Ctrl+T from the sidebar did not filter the inbox')
+        send(b'\x14')
+        until(lambda: 'YOUR INBOX · OPEN' not in native_screen() and 'YOUR INBOX' in native_screen(), 'Ctrl+T did not restore the inbox')
+        send(b'\x1b[17~')
         until(dogs_visible, 'the dogs disappeared when messages arrived')
         first_dog_picture = dog_picture()
         until(lambda: dog_picture() and dog_picture() != first_dog_picture, 'the dogs did not animate')
@@ -262,12 +267,17 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         # Activity is visible in a full right pane without replacing native sessions.
         send(b'\x16')
         until(lambda: 'ACTIVITY' in native_screen() and 'API question' in native_screen() and 'QUEUED · WAITING' in native_screen() and 'FAILED' in native_screen() and 'UNKNOWN' in native_screen(), 'activity did not show delivery and reply states')
+        send(b'\x14')
+        until(lambda: 'CONVERSATIONS' in native_screen() and '3 MSG' in native_screen(), 'Ctrl+T from the sidebar did not open conversations')
+        send(b'\x14')
+        until(lambda: 'ACTIVITY' in native_screen() and 'Offline message' in native_screen(), 'Ctrl+T did not return to activity')
         click_message('Offline message')
         send(b'\r')
         until(lambda: 'MESSAGE DETAILS' in native_screen() and 'Cannot queue: failed' in native_screen(), 'failed delivery details were not visible')
         send(b'\x1b')
         send(b'\x14')
         until(lambda: 'CONVERSATIONS' in native_screen() and 'API question' in native_screen() and '3 MSG' in native_screen(), 'related messages were not grouped into a conversation')
+        until(lambda: '▸' in message_header('Offline message'), 'Ctrl+T did not keep the selected conversation')
         if os.environ.get('ANLE_COLLAB_DUMP'):
             print('CONVERSATIONS\n' + '\n'.join(line.rstrip() for line in native_screen().splitlines()), flush=True)
         resize_client = int(tmux('list-clients', '-F', '#{client_pid}').splitlines()[0])
@@ -353,6 +363,10 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         assert foreground_at(front_name, 'frontend') != foreground_at(back_name, 'backend'), 'sidebar names did not distinguish the selection'
         until(lambda: 'FAKE CODEX mock-agent' in native_screen(), 'frontend native pane did not open')
         frontend_pane = native_pane()
+        send(b'\x14')
+        until(lambda: (work / 'native-input.log').exists() and b'\x14' in (work / 'native-input.log').read_bytes(), 'Ctrl+T from the sidebar did not reach the native Codex pane')
+        assert tmux('display-message', '-p', '-t', 'workspace:0', '#{pane_id}') == frontend_pane, 'Ctrl+T did not focus the native Codex pane'
+        send(b'\x1b[17~')
         send(b'\r')
         until(lambda: tmux('display-message', '-p', '-t', 'workspace:0', '#{pane_id}') != left, 'Enter did not focus Codex')
         send(b'unsent draft')

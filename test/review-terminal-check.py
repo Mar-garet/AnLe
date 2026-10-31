@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import sqlite3
@@ -34,6 +35,10 @@ wss.on('connection', ws => ws.on('message', raw => {
   else if (req.method === 'thread/list') result = {data:threads, nextCursor:null};
   else if (req.method === 'thread/loaded/list') result = {data:threads.map(thread => thread.id)};
   else if (req.method === 'thread/read') result = {thread:threads.find(thread => thread.id === req.params.threadId)};
+  else if (req.method === 'thread/resume') {
+    appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(req) + '\n');
+    result = {thread:threads.find(thread => thread.id === req.params.threadId), sandbox:{type:'readOnly'}, approvalPolicy:'never'};
+  }
   else if (req.method === 'thread/turns/list') result = {data:[{id:`turn-${turns}`,status:'inProgress'}],nextCursor:null};
   else if (req.method === 'thread/start') {
     appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(req) + '\n');
@@ -76,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
     fake_bin = work / 'bin'
     fake_bin.mkdir()
     fake_codex = fake_bin / 'codex'
-    fake_codex.write_text('#!/bin/sh\ncase " $* " in *" queue "*) printf "%s\\n" "$@" >> "$SEREIN_FAKE_LOG"; echo queued; exit 0;; esac\nprintf "%s\\n" "$@" >> "$SEREIN_RESUME_LOG"\nprintf "FAKE CODEX %s\\n" "$2"\nexec cat\n')
+    fake_codex.write_text('#!/bin/sh\ncase "$1" in queue|resume) for arg in "$@"; do case "$arg" in --ask-for-approval|--sandbox|--cd) echo "unsupported remote option: $arg" >&2; exit 2;; esac; done;; esac\ncase " $* " in *" queue "*) printf "%s\\n" "$@" >> "$SEREIN_FAKE_LOG"; echo queued; exit 0;; esac\nprintf "%s\\n" "$@" >> "$SEREIN_RESUME_LOG"\nprintf "FAKE CODEX %s\\n" "$2"\nexec cat\n')
     fake_codex.chmod(0o755)
     server_file = work / 'server.mjs'
     server_file.write_text(SERVER)
@@ -135,6 +140,23 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         def sidebar(): return tmux('capture-pane', '-p', '-t', left)
         def native_pane(): return tmux('list-panes', '-t', 'workspace:0', '-F', '#{pane_id}').splitlines()[1]
         def screen(): return tmux('capture-pane', '-p', '-t', native_pane())
+        def selected_color(label):
+            lines = tmux('capture-pane', '-p', '-e', '-t', left).splitlines()
+            line = next(line for line in lines if f'▸ {label}' in re.sub(r'\x1b\[[0-9;]*m', '', line))
+            codes = re.findall(r'\x1b\[([0-9;]*)m', line.split(label, 1)[0])
+            color = None
+            for code in codes:
+                values = [int(value or 0) for value in code.split(';')]
+                if values[:2] == [38, 5] and len(values) >= 3:
+                    n = values[2] - 16
+                    if 0 <= n < 216:
+                        steps = [0, 95, 135, 175, 215, 255]
+                        color = (steps[n // 36], steps[(n // 6) % 6], steps[n % 6])
+                elif values[:2] == [38, 2] and len(values) >= 5:
+                    color = tuple(values[2:5])
+                elif values in ([0], [39]):
+                    color = None
+            return color
         def send(data):
             os.write(master, data)
             drain(master)
@@ -153,12 +175,17 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         for _ in range(4):
             send(b'\x1b[B')
         until(lambda: '▸ other CR' in sidebar(), 'dedicated reviewer did not become selected')
+        cr_color = selected_color('other CR')
+        assert cr_color and cr_color[0] > cr_color[2], f'selected CR is not red: {cr_color}'
         send(b'\x0b')
         until(lambda: 'REVIEW GOAL' in sidebar(), 'review shortcut on a CR did not target its coding session')
         send(b'\x1b')
         for _ in range(3):
             send(b'\x1b[A')
         until(lambda: '▸ backend' in sidebar(), 'developer did not become selected')
+        coding_color = selected_color('backend')
+        assert coding_color and coding_color[2] > coding_color[0], f'selected coding session is not blue: {coding_color}'
+        assert coding_color != cr_color
         send(b'\x19')
         until(lambda: 'WORKSPACE REVIEW RULES' in sidebar(), 'workspace review rules did not open')
         send(b'Check shared auth helpers')
@@ -186,8 +213,9 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         until(lambda: '▸ backend CR' in sidebar() and 'FAKE CODEX review-1' in screen(), 'native reviewer session did not open')
         resume_log = (work / 'resume.log').read_text()
         reviewer_resume = resume_log.split('resume\nreview-1\n', 1)[1].split('resume\n', 1)[0]
-        assert '--sandbox\nread-only\n' in reviewer_resume, 'native reviewer did not retain its read-only policy'
-        assert f'--cd\n{first}\n' in reviewer_resume or f'--cd\n{repo}\n' in reviewer_resume, 'native reviewer used an unrelated directory'
+        assert '--remote\n' in reviewer_resume, 'native reviewer did not connect to its existing session'
+        assert all(flag not in reviewer_resume for flag in ('--sandbox\n', '--ask-for-approval\n', '--cd\n')), 'native remote resume received unsupported overrides'
+        assert any(event['method'] == 'thread/resume' and event['params']['threadId'] == 'review-1' for event in events()), 'native reviewer permissions were not checked'
         send(b'\x1b[A')
         send(b'\x1b[A')
         until(lambda: '▸ backend' in sidebar(), 'could not return to the developer')
@@ -206,16 +234,9 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         assert result['result']['freshness'] == 'current'
         assert result['deliveries']['developer']['state'] in ('queued', 'sending')
         until(lambda: db.execute("SELECT state FROM review_notifications WHERE review_id=? AND round=1 AND recipient_id='dev-1'", (review_id,)).fetchone()[0] == 'queued', 'review result was not queued to the developer')
-        until(lambda: '1 NEW' in sidebar(), 'human did not receive the review')
-        send(b'\x0e')
-        until(lambda: 'REVIEW · Review login safety' in screen(), 'review notification did not reach the inbox')
-        send(b'\r')
-        until(lambda: 'Authentication needs work' in screen() and 'F1 [P1]' in screen(), 'review findings did not reach the inbox')
+        assert db.execute("SELECT count(*) FROM messages WHERE recipient_id='human'").fetchone()[0] == 0, 'ordinary review should not reach the human inbox'
         assert 'Authentication needs work' in (work / 'queue.log').read_text()
 
-        send(b'\x1b[17~')
-        send(b'\x1b[B')
-        until(lambda: '▸ backend' in sidebar(), 'could not return to developer')
         (repo / 'auth.js').write_text('export const auth = "fixed";\n')
         until(lambda: db.execute('SELECT status FROM reviews WHERE id=?', (review_id,)).fetchone()[0] == 'waiting', 'review result was not saved')
         send(b'\x0b')
@@ -243,6 +264,15 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         assert json.loads(next_round['content'][0]['text'])['round'] == 3
         assert len([event for event in events() if event['method'] == 'thread/start']) == 2
         assert Path(repo, 'auth.js').read_text() == 'export const auth = "changed again";\n'
+        uncertain = call_mcp('submit_review', {'space_id':'default', 'review_id':review_id, 'round':3, 'summary':'Need a policy decision',
+            'findings':[], 'human_question':'Should login allow guest access?'}, reviewer_id)
+        assert not uncertain.get('isError'), uncertain
+        assert json.loads(uncertain['content'][0]['text'])['deliveries']['human']['state'] == 'delivered'
+        until(lambda: '1 NEW' in sidebar(), 'a review needing a human decision did not reach the inbox')
+        send(b'\x0e')
+        until(lambda: 'REVIEW NEEDS YOUR INPUT' in screen(), 'review question did not appear in the inbox')
+        send(b'\r')
+        until(lambda: 'Should login allow guest access?' in screen(), 'human question did not reach the inbox')
 
         peers = call_mcp('list_members', {'space_id':'default'}, 'dev-1')
         members = json.loads(peers['content'][0]['text'])['members']
@@ -253,11 +283,19 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         sent_id = json.loads(sent['content'][0]['text'])['id']
         queued_text = (work / 'queue.log').read_text()
         assert 'Project background: Shared login service' in queued_text and 'Base branch/ref: main' in queued_text
-        assert 'Development branch/ref: feature/login' in queued_text and '--sandbox\nread-only\n' in queued_text
+        assert 'Development branch/ref: feature/login' in queued_text
+        assert '--ask-for-approval\n' not in queued_text and '--sandbox\n' not in queued_text and '--cd\n' not in queued_text
         response = call_mcp('reply_message', {'space_id':'default', 'reply_to':sent_id, 'message':'Found an auth regression.'}, reviewer_id)
         assert not response.get('isError'), response
-        assert json.loads(response['content'][0]['text'])['human_delivery']['state'] == 'delivered'
-        assert db.execute("SELECT count(*) FROM messages WHERE recipient_id='human' AND body='Found an auth regression.'").fetchone()[0] == 1
+        assert 'human_delivery' not in json.loads(response['content'][0]['text'])
+        assert db.execute("SELECT count(*) FROM messages WHERE recipient_id='human' AND body='Found an auth regression.'").fetchone()[0] == 0
+        followup = call_mcp('send_message', {'space_id':'default', 'to':'backend CR', 'message':'Review the new policy.', 'reply_expected':True}, 'dev-1')
+        followup_id = json.loads(followup['content'][0]['text'])['id']
+        uncertain_reply = call_mcp('reply_message', {'space_id':'default', 'reply_to':followup_id, 'message':'The policy is ambiguous.',
+            'human_question':'Should guest access be allowed?'}, reviewer_id)
+        assert not uncertain_reply.get('isError'), uncertain_reply
+        assert json.loads(uncertain_reply['content'][0]['text'])['human_delivery']['state'] == 'delivered'
+        assert db.execute("SELECT count(*) FROM messages WHERE recipient_id='human' AND body='Should guest access be allowed?'").fetchone()[0] == 1
 
         send(b'\x1b[17~')
         send(b'\x01')
@@ -279,6 +317,23 @@ with tempfile.TemporaryDirectory(prefix='anle-review-terminal-', dir='/tmp') as 
         until(lambda: 'Your dedicated reviewer is mobile CR' in (work / 'queue.log').read_text(), 'coding session did not receive its CR introduction')
         assert len([event for event in events() if event['method'] == 'thread/start']) == 3
         assert len([event for event in events() if event['method'] == 'turn/start']) == 3, 'pairing should not start a model turn'
+        send(b'\x01')
+        until(lambda: 'SELECT SESSION' in sidebar(), 'session picker did not reopen')
+        send(b'/')
+        send(b'backend CR')
+        send(b'\r')
+        until(lambda: '▸ backend CR' in sidebar(), 'reviewer was not selected in picker')
+        picker_cr_color = selected_color('backend CR')
+        assert picker_cr_color and picker_cr_color[0] > picker_cr_color[2], 'selected CR in picker is not red'
+        send(b'\x1b')
+        send(b'\x01')
+        until(lambda: 'SELECT SESSION' in sidebar(), 'session picker did not reopen for coding color')
+        send(b'/')
+        send(b'New coding')
+        send(b'\r')
+        until(lambda: '▸ mobile' in sidebar(), 'coding session was not selected in picker')
+        picker_coding_color = selected_color('mobile')
+        assert picker_coding_color and picker_coding_color[2] > picker_coding_color[0], 'selected coding session in picker is not blue'
     finally:
         if db:
             db.close()

@@ -4,6 +4,7 @@ import {basename} from 'node:path';
 import stringWidth from 'string-width';
 import {ANLE_WORDMARK, ANLE_WORDMARK_WIDTH} from './brand.js';
 import {CodexClient} from './codex.js';
+import {reconcileCRReports} from './cr-report.js';
 import {groupConversations} from './conversations.js';
 import {draftViewport, editDraft} from './editor.js';
 import {displaySessionItem, readSessionHistory, safeTerminalText} from './history.js';
@@ -11,7 +12,7 @@ import {deliveryLabel, humanNeedsAttention, replyLabel} from './message-status.j
 import {notifyHumanMessages} from './notifications.js';
 import {PET_COMPACT_WIDTH, PET_FRAME_MS, PET_SCENE_HEIGHT, PET_SCENE_WIDTH, petFrame} from './pet-animation.js';
 import {continueReview, reconcileReviews, startReview} from './review.js';
-import {ensureReviewerPair, queueToReviewer, reviewerInstructions} from './reviewer.js';
+import {ensureReviewerPair, prepareReadOnlySession, prepareReviewer, queueToReviewer, reviewerInstructions} from './reviewer.js';
 import {HUMAN, Store} from './store.js';
 import {introduce, replyMessage, sendMessage} from './messaging.js';
 import {MouseSequenceParser, positionForScrollbarRow, scrollbarGeometry} from './scroll.js';
@@ -22,8 +23,9 @@ const h = React.createElement;
 const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
 // Keep normal text on the terminal's own foreground and use accents that
 // remain visible on both light and dark backgrounds, including 256 colors.
-const C = {purple: '#7f4ce5', cyan: '#197f7f', yellow: '#b24c19', an: '#a56a0b', path: '#267f97', pathActive: '#c1561e', foreground: undefined, muted: '#767676', red: '#b24c4c', green: '#197f4c'};
+const C = {purple: '#7f4ce5', cyan: '#197f7f', yellow: '#b24c19', an: '#a56a0b', path: '#267f97', pathActive: '#c1561e', selectedCoding: '#2875d1', selectedReviewer: '#ce3945', foreground: undefined, muted: '#767676', red: '#b24c4c', green: '#197f4c'};
 const T = (value, color = C.foreground, props = {}) => h(Text, {color, ...props}, value);
+const selectedNodeColor = node => node.is_reviewer ? C.selectedReviewer : C.selectedCoding;
 // Single-cell corners give the frame a pixel accent without taking content space.
 const PIXEL_BORDER = {topLeft: '▛', top: '─', topRight: '▜', left: '│', right: '│', bottomLeft: '▙', bottom: '─', bottomRight: '▟'};
 const SHARED_HELP_LINES = [
@@ -58,6 +60,15 @@ function inboxPetLayout(width, height, composeHeight, empty) {
 
 export async function startConsole({nativeManager = null, inboxOnly = false, activityOnly = false, initialSpaceId = null} = {}) {
   const store = new Store();
+  if (nativeManager) nativeManager.prepareReviewer = async (member, socketPath) => {
+    if (!socketPath) throw new Error('The Codex server is not connected.');
+    const client = new CodexClient(socketPath);
+    try {
+      await client.open();
+      if (store.pairForReviewer(member.space_id, member.thread_id)) await prepareReviewer(client, store, member.space_id, member.thread_id);
+      else await prepareReadOnlySession(client, member.thread_id, {cwd: member.cwd});
+    } finally { client.close(); }
+  };
   const instance = render(h(Console, {store, nativeManager, inboxOnly, activityOnly, initialSpaceId}), {alternateScreen: true, exitOnCtrlC: !nativeManager && !inboxOnly && !activityOnly});
   await instance.waitUntilExit();
   store.close();
@@ -78,6 +89,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [members, setMembers] = useState([]);
   const [reviews, setReviews] = useState([]);
   const [reviewerPairs, setReviewerPairs] = useState([]);
+  const [reviewerIds, setReviewerIds] = useState([]);
   const [messages, setMessages] = useState([]);
   const [humanMessages, setHumanMessages] = useState([]);
   const [inboxPendingOnly, setInboxPendingOnly] = useState(false);
@@ -114,6 +126,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [notice, setNotice] = useState(inboxOnly ? 'Select a message and type your reply · Enter sends' : activityOnly ? 'Select a message · Enter opens details' : nativeManager ? 'F6/F7 focus · CR auto-paired' : 'Select a session and type below · Ctrl+N opens your inbox');
 
   const space = spaces.find(item => item.id === spaceId) || spaces[0];
+  const currentDraft = draft?.review ? {...draft, review: reviews.find(item => item.id === draft.review.id) || draft.review} : draft;
   const selectedMember = selection === 0 ? {thread_id: HUMAN, name: 'human', role: 'Your node'} : members[selection - 1];
   const selectedReview = reviews.find(item => item.reviewer_id === selectedMember?.thread_id && item.status !== 'closed');
   const selectedPair = reviewerPairs.find(item => item.reviewer_id === selectedMember?.thread_id && item.status === 'ready');
@@ -133,10 +146,11 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const detailMessage = messages.find(message => message.id === detailMessageId) || humanMessages.find(message => message.id === detailMessageId);
   const sessionThreadId = view === 'node' && selection > 0 ? selected?.thread_id : null;
   const membersByThread = useMemo(() => new Map(members.map(member => [member.thread_id, member])), [members]);
+  const reviewerIdSet = useMemo(() => new Set(reviewerIds), [reviewerIds]);
   const sidebarMembers = useMemo(() => {
     const threadPaths = new Map(threads.map(thread => [thread.id, thread.cwd]));
-    return members.map(member => member.cwd ? member : {...member, cwd: threadPaths.get(member.thread_id) || ''});
-  }, [members, threads]);
+    return members.map(member => ({...member, cwd: member.cwd || threadPaths.get(member.thread_id) || '', is_reviewer: reviewerIdSet.has(member.thread_id)}));
+  }, [members, threads, reviewerIdSet]);
   const selectedMessage = conversationList ? null : mode === 'detail' ? detailMessage : focus !== 'nodes' && !sessionThreadId ? contentMessages[messageSelection] : null;
   const replyMember = selectedMessage?.recipient_id === HUMAN ?
     (selectedMessage.space_id === space.id ? membersByThread.get(selectedMessage.sender_id) : store.member(selectedMessage.space_id, selectedMessage.sender_id)) : null;
@@ -195,9 +209,10 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       cwd: thread.cwd || member?.cwd || '',
       name: safeTerminalText(member?.name || thread.name || thread.preview || 'Untitled session').replace(/[\r\n\t]/g, ' '),
       added: !!member,
+      is_reviewer: reviewerIdSet.has(thread.id),
       status: statusLabel(thread.status?.type),
     };
-  }), [candidates, membersByThread]);
+  }), [candidates, membersByThread, reviewerIdSet]);
 
   const refreshStore = useCallback(() => {
     if (!inboxOnly && !activityOnly && Date.now() - lastDeliveryRecovery.current >= 30000) {
@@ -209,6 +224,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     if (!inboxOnly && !activityOnly) {
       setReviews(store.reviews(spaceId).map(review => ({...review, snapshot_path: store.reviewRounds(review.id).at(-1)?.snapshot_path || null})));
       setReviewerPairs(store.reviewerPairs(spaceId));
+      setReviewerIds(store.reviewerThreadIds());
     }
     setMessages(store.messages(spaceId, null));
     setHumanMessages(store.humanInbox());
@@ -355,7 +371,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     const poll = async () => {
       if (busy) return;
       busy = true;
-      try { await reconcileReviews(store, client); } catch {}
+      try { await reconcileReviews(store, client); await reconcileCRReports(store, client); } catch {}
       finally { busy = false; }
     };
     void poll();
@@ -489,8 +505,12 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
 
   function toggleConversations() {
     const next = !conversationMode;
+    const current = mode === 'detail' ? detailMessage : contentMessages[messageSelection];
+    const id = conversationId || current?.conversation_id || current?.id;
+    const index = next ? conversations.findIndex(group => group.conversation_id === id) :
+      messages.findLastIndex(message => (message.conversation_id || message.id) === id);
     setConversationMode(next); setConversationId(null); setMode('normal'); setDetailMessageId(null);
-    setMessageSelection(Math.max(0, (next ? conversations.length : messages.length) - 1));
+    setMessageSelection(index >= 0 ? index : Math.max(0, (next ? conversations.length : messages.length) - 1));
     setFocus('messages');
   }
 
@@ -726,8 +746,8 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     if (mode === 'review-action') {
       if (key.escape) { finish(); return; }
       if (keyInput.toLowerCase() === 'n') { setDraft({member: draft.member, spaceId: draft.spaceId}); prompt('review-goal', draft.member.current_task || ''); return; }
-      if (keyInput.toLowerCase() === 'r' && ['waiting', 'failed'].includes(draft.review.status)) {
-        const request = {...draft};
+      if (keyInput.toLowerCase() === 'r' && ['waiting', 'failed'].includes(currentDraft.review.status)) {
+        const request = {...currentDraft};
         finish(); setNotice('Preparing another review round…');
         run(async () => {
           const result = await continueReview({store, spaceId: request.spaceId, reviewId: request.review.id, initiatorId: HUMAN, client});
@@ -797,6 +817,12 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     if (!nativeManager && selection === 0 && view === 'node' && focus !== 'nodes' && key.ctrl && keyInput.toLowerCase() === 'd') { toggleHumanDone(); return; }
     if (!nativeManager && view === 'activity' && key.ctrl && keyInput.toLowerCase() === 't') { toggleConversations(); return; }
     if (!nativeManager && view === 'activity' && key.ctrl && ['o', 'p'].includes(keyInput.toLowerCase())) { openParticipant(keyInput.toLowerCase() === 'o' ? 'sender' : 'recipient'); return; }
+    if (nativeManager && mode === 'normal' && key.ctrl && keyInput.toLowerCase() === 't') {
+      const panel = view === 'activity' ? 'activity' : selection === 0 ? 'inbox' : null;
+      if (panel) nativeManager.forwardPanelShortcut(space.id, panel, 'C-t').catch(error => setNotice(error.message || String(error)));
+      else if (selected && client) nativeManager.forwardSessionShortcut(selected, client.socketPath, 'C-t').catch(error => setNotice(error.message || String(error)));
+      return;
+    }
     if (command('v')) {
       setMode('normal');
       const nextView = view === 'activity' ? 'node' : 'activity';
@@ -1119,11 +1145,11 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const statusMap = Object.fromEntries(threads.map(thread => [thread.id, thread.status?.type]));
   if (inboxOnly || activityOnly) {
     return h(Box, {flexDirection: 'column'},
-      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
+      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
       T(` ${safeTerminalText(notice).replaceAll('\n', ' ')} · F6 sessions`, C.muted, {wrap: 'truncate-end'}));
   }
   if (nativeManager) {
-    return h(CompactSidebar, {size, selected, members: sidebarMembers, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
+    return h(CompactSidebar, {size, selected, members: sidebarMembers, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
   }
   if (size.columns < 64 || size.rows < 18) {
     return h(Box, {padding: 1, flexDirection: 'column'}, h(Text, {bold: true}, T('An', C.an), T('Le', C.foreground)), T('Resize the terminal to at least 64 × 18. Press Ctrl+Q to quit.', C.muted));
@@ -1133,7 +1159,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     h(Header, {connection, spaceCount: spaces.length, unreadCount}),
     h(Box, {flexDirection: 'row'},
       h(Sidebar, {space, members: sidebarMembers, selectedIndex: selection, sidebarScroll, statusMap, unreadCount, attentionCount, width: sidebarWidth, height: panelHeight}),
-      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
+      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft: currentDraft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
     ),
     h(Box, {paddingX: 1}, T('◆ ', C.yellow), T(notice, C.muted, {wrap: 'truncate-end'})),
     h(Box, {paddingX: 1, overflow: 'hidden'}, T('Tab', C.cyan), T(' focus  ', C.muted), T('^A', C.cyan), T(' add  ', C.muted), T('^N', C.cyan), T(' inbox  ', C.muted), T('^V', C.cyan), T(view === 'activity' ? ' node  ' : ' feed  ', C.muted), T('^P', C.cyan), T(' help  ', C.muted), T('^Q', C.cyan), T(' quit', C.muted)),
@@ -1143,15 +1169,15 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
 function renderPickerRows(rows, selection, {idLength, showStatus, innerWidth}) {
   return rows.map(({node, index, type, text, part}) => {
     const active = index === selection;
-    if (type === 'path') return T(`  ${text}`, node.cwd ? active ? C.pathActive : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: active && !!node.cwd, wrap: 'truncate-end'});
+    if (type === 'path') return T(`  ${text}`, node.cwd ? active ? selectedNodeColor(node) : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: active && !!node.cwd, wrap: 'truncate-end'});
     const badge = node.added ? '[ADDED]' : node.status === 'OFFLINE' ? 'OFFLINE' : '';
     let tags = [node.added ? '[ADDED]' : '', node.thread_id.slice(-idLength), showStatus || (!node.added && node.status === 'OFFLINE') ? node.status : ''].filter(Boolean).join(' · ');
     const tagLimit = Math.max(4, innerWidth - 9);
     if (stringWidth(tags) > tagLimit) tags = [badge, node.thread_id.slice(-4)].filter(Boolean).join(' ');
     if (stringWidth(tags) > tagLimit) tags = badge || node.thread_id.slice(-4);
-    return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', C.yellow)),
-      h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? C.pathActive : C.foreground, {bold: active, wrap: 'truncate-end'})),
-      h(Box, {marginLeft: 1, flexShrink: 0}, T(tags, active ? C.yellow : C.muted, {wrap: 'truncate-end'})));
+    return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', active ? selectedNodeColor(node) : C.muted)),
+      h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? selectedNodeColor(node) : C.foreground, {bold: active, wrap: 'truncate-end'})),
+      h(Box, {marginLeft: 1, flexShrink: 0}, T(tags, active ? selectedNodeColor(node) : C.muted, {wrap: 'truncate-end'})));
   });
 }
 
@@ -1259,11 +1285,11 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
     nodeOverflow = total > room;
     body = rows.map(({node, index, type, text, part}) => {
       const active = index === selection;
-      if (type === 'path') return T(`  ${text}`, node.cwd ? active ? C.pathActive : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: active && !!node.cwd, wrap: 'truncate-end'});
+      if (type === 'path') return T(`  ${text}`, node.cwd ? active ? selectedNodeColor(node) : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: active && !!node.cwd, wrap: 'truncate-end'});
       const state = node.thread_id === HUMAN ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
-      return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', C.yellow)),
-        h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? C.pathActive : C.foreground, {bold: active, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, active))));
+      return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', active ? selectedNodeColor(node) : C.muted)),
+        h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? selectedNodeColor(node) : C.foreground, {bold: active, wrap: 'truncate-end'})),
+        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, active, selectedNodeColor(node)))));
     });
   }
   const editor = showEditor ? h(Box, {height: 2, flexDirection: 'column', key: 'editor'},
@@ -1299,15 +1325,15 @@ function Sidebar({space, members, selectedIndex, sidebarScroll, statusMap, unrea
     T('─'.repeat(Math.max(4, width - 4)), C.muted),
     ...rows.map(({node, index, type, text, part}) => {
       const selected = index === selectedIndex;
-      if (type === 'path') return T(`    ${text}`, node.cwd ? selected ? C.pathActive : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: selected && !!node.cwd, wrap: 'truncate-end'});
+      if (type === 'path') return T(`    ${text}`, node.cwd ? selected ? selectedNodeColor(node) : C.path : C.muted, {key: `${node.thread_id}:path:${part}`, bold: selected && !!node.cwd, wrap: 'truncate-end'});
       const state = node.thread_id === HUMAN ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
       return h(Box, {key: `${node.thread_id}:name`},
         h(Box, {width: 4, flexShrink: 0},
-          T(selected ? '▸' : ' ', C.yellow),
+          T(selected ? '▸' : ' ', selected ? selectedNodeColor(node) : C.muted),
           T(` ${node.thread_id === HUMAN ? '▧' : '▣'} `, C.foreground, {bold: selected})),
         h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'},
-          T(node.name, selected ? C.pathActive : C.foreground, {bold: selected, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, selected))));
+          T(node.name, selected ? selectedNodeColor(node) : C.foreground, {bold: selected, wrap: 'truncate-end'})),
+        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, selected, selectedNodeColor(node)))));
     }),
     members.length === 0 ? T('  Ctrl+A: add session', C.muted, {wrap: 'truncate-end'}) : null,
   );
@@ -1485,11 +1511,11 @@ function statusLabel(value) {
   return {active: 'BUSY', idle: 'IDLE', notLoaded: 'OFFLINE', systemError: 'ERROR'}[value] || 'UNKNOWN';
 }
 
-function nodeStateColor(state, active) {
+function nodeStateColor(state, active, selectedColor) {
   if (state.endsWith(' NEW') || state.endsWith(' OPEN')) return C.yellow;
   if (state === 'ERROR') return C.red;
   if (state === 'BUSY') return C.green;
-  return active ? C.yellow : C.muted;
+  return active ? selectedColor : C.muted;
 }
 
 function suggestedName(thread, members) {

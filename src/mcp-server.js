@@ -1,6 +1,8 @@
 // A local MCP adapter runs outside the agent's shell sandbox. Codex supplies
 // the calling thread identity in _meta, so agents never choose their sender ID.
 import readline from 'node:readline';
+import {CodexClient} from './codex.js';
+import {reconcileCRReports} from './cr-report.js';
 import {Store} from './store.js';
 import {conversationForAgent, peerList, replyMessage, resolveAgentSpace, sendMessage} from './messaging.js';
 import {continueReview, reviewDetails, startReview, submitReview} from './review.js';
@@ -27,8 +29,8 @@ const tools = [
   },
   {
     name: 'reply_message',
-    description: 'Reply to an AnLe message sent to this session. Set reply_expected to true if this reply includes a follow-up question; otherwise it defaults to false.',
-    inputSchema: {type: 'object', properties: {space_id: {type: 'string'}, reply_to: {type: 'string', description: 'ID of the message being answered.'}, message: {type: 'string'}, reply_expected: {type: 'boolean', description: 'Whether this reply requests a further answer.'}}, required: ['reply_to', 'message'], additionalProperties: false},
+    description: 'Reply to an AnLe message sent to this session. A CR can include human_question only when unresolved uncertainty requires a human decision. Set reply_expected to true if the reply asks the recipient a follow-up question.',
+    inputSchema: {type: 'object', properties: {space_id: {type: 'string'}, reply_to: {type: 'string', description: 'ID of the message being answered.'}, message: {type: 'string'}, human_question: {type: 'string', maxLength: 2000, description: 'For a CR reply to its coding agent, ask a human decision only when necessary.'}, reply_expected: {type: 'boolean', description: 'Whether this reply requests a further answer.'}}, required: ['reply_to', 'message'], additionalProperties: false},
     annotations: {readOnlyHint: false, destructiveHint: false, openWorldHint: false},
   },
   {
@@ -63,13 +65,26 @@ const tools = [
   },
   {
     name: 'submit_review',
-    description: 'As the assigned reviewer, submit this round and deliver its result to the development session and human inbox. Include every previous open finding by ID with its current status; explain resolved or dismissed items. New findings need severity, title, relative path, line and concrete detail. An empty list is valid when no findings exist.',
-    inputSchema: {type: 'object', properties: {space_id: {type: 'string'}, review_id: {type: 'string'}, round: {type: 'integer', minimum: 1}, summary: {type: 'string', maxLength: 4000}, checked: {type: 'array', maxItems: 30, items: {type: 'string'}}, unverified: {type: 'array', maxItems: 30, items: {type: 'string'}}, findings: {type: 'array', maxItems: 80, items: {type: 'object', properties: {id: {type: 'string'}, severity: {type: 'string', enum: ['P0', 'P1', 'P2', 'P3']}, title: {type: 'string'}, path: {type: 'string'}, line: {type: 'integer', minimum: 1}, detail: {type: 'string'}, status: {type: 'string', enum: ['open', 'resolved', 'dismissed']}, reason: {type: 'string'}}, additionalProperties: false}}}, required: ['review_id', 'round', 'summary', 'findings'], additionalProperties: false},
+    description: 'As the assigned reviewer, always submit a result to the coding session, even when there are no findings. Only provide human_question when uncertainty requires a human decision. Include every previous open finding by ID with its current status and explain resolved or dismissed items.',
+    inputSchema: {type: 'object', properties: {space_id: {type: 'string'}, review_id: {type: 'string'}, round: {type: 'integer', minimum: 1}, summary: {type: 'string', maxLength: 4000}, human_question: {type: 'string', maxLength: 2000, description: 'Only when a human decision is needed to resolve uncertainty; omit otherwise.'}, checked: {type: 'array', maxItems: 30, items: {type: 'string'}}, unverified: {type: 'array', maxItems: 30, items: {type: 'string'}}, findings: {type: 'array', maxItems: 80, items: {type: 'object', properties: {id: {type: 'string'}, severity: {type: 'string', enum: ['P0', 'P1', 'P2', 'P3']}, title: {type: 'string'}, path: {type: 'string'}, line: {type: 'integer', minimum: 1}, detail: {type: 'string'}, status: {type: 'string', enum: ['open', 'resolved', 'dismissed']}, reason: {type: 'string'}}, additionalProperties: false}}}, required: ['review_id', 'round', 'summary', 'findings'], additionalProperties: false},
     annotations: {readOnlyHint: false, destructiveHint: false, openWorldHint: false},
   },
 ];
 
 const store = new Store();
+const activeThreads = new Set();
+let reportMonitor = null;
+const reportTimer = setInterval(() => {
+  try {
+    if (reportMonitor || !activeThreads.size || !store.pendingCRReports(activeThreads).length) return;
+    reportMonitor = (async () => {
+      const client = await CodexClient.connect();
+      try { await reconcileCRReports(store, client, {participantIds: activeThreads}); }
+      finally { client.close(); }
+    })().catch(() => {}).finally(() => { reportMonitor = null; });
+  } catch {}
+}, 5000);
+reportTimer.unref();
 const lines = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
 for await (const line of lines) {
   let request;
@@ -100,12 +115,15 @@ for await (const line of lines) {
     send({jsonrpc: '2.0', id: request.id, result: {content: [{type: 'text', text: `${String(error.message || error)}${delivery}`}], isError: true}});
   }
 }
+clearInterval(reportTimer);
+if (reportMonitor) await reportMonitor;
 store.close();
 
 async function callTool(params) {
   const meta = params._meta || {};
   const threadId = meta.threadId || meta['x-codex-turn-metadata']?.thread_id;
   if (!threadId) throw new Error('Codex did not provide a session identity. Check your Codex version.');
+  activeThreads.add(threadId);
   const args = params.arguments || {};
   const space = resolveAgentSpace(store, threadId, args.space_id);
   let value;
@@ -122,13 +140,19 @@ async function callTool(params) {
     const result = await sendMessage(store, {spaceId: space.id, senderId: threadId, to: args.to, body: args.message, contextMessageId: args.context_message_id, replyExpected: args.reply_expected, reviewContext: args.review_context});
     value = {id: result.id, conversation_id: result.conversation_id, to: result.recipient_name, state: result.state, body: result.body};
   } else if (params.name === 'reply_message') {
+    const question = args.human_question;
+    if (question !== undefined) {
+      if (typeof question !== 'string' || !question.trim() || question.length > 2000) throw new Error('Human question must be non-empty text of at most 2000 characters');
+      const pair = store.pairForReviewer(space.id, threadId);
+      const original = store.message(args.reply_to);
+      if (!pair || !original || original.space_id !== space.id || original.sender_id !== pair.developer_id || original.recipient_id !== threadId) throw new Error('Only a CR replying to its coding agent can include a human question');
+    }
     const result = await replyMessage(store, {spaceId: space.id, senderId: threadId, replyTo: args.reply_to, body: args.message, replyExpected: args.reply_expected});
     value = {id: result.id, conversation_id: result.conversation_id, to: result.recipient_name, state: result.state, body: result.body};
-    const pair = store.pairForReviewer(space.id, threadId);
-    if (pair && result.recipient_id === pair.developer_id && args.reply_expected !== true) {
+    if (question !== undefined) {
       try {
-        const copy = await sendMessage(store, {spaceId: space.id, senderId: threadId, to: 'human', body: result.body, contextMessageId: result.id, replyExpected: false});
-        value.human_delivery = {id: copy.id, state: copy.state};
+        const inquiry = await sendMessage(store, {spaceId: space.id, senderId: threadId, to: 'human', body: question.trim(), contextMessageId: result.id, replyExpected: true});
+        value.human_delivery = {id: inquiry.id, state: inquiry.state};
       } catch (error) { value.human_delivery = {state: 'failed', error: String(error.message || error)}; }
     }
   } else if (params.name === 'get_message_status') {
@@ -151,7 +175,7 @@ async function callTool(params) {
   } else if (params.name === 'get_review') {
     value = reviewDetails(store, space.id, args.review_id, threadId);
   } else if (params.name === 'submit_review') {
-    value = await submitReview({store, spaceId: space.id, reviewerId: threadId, reviewId: args.review_id, round: args.round, summary: args.summary, findings: args.findings, checked: args.checked, unverified: args.unverified});
+    value = await submitReview({store, spaceId: space.id, reviewerId: threadId, reviewId: args.review_id, round: args.round, summary: args.summary, findings: args.findings, checked: args.checked, unverified: args.unverified, humanQuestion: args.human_question});
   } else {
     throw new Error('Unknown AnLe tool');
   }

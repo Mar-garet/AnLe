@@ -80,6 +80,15 @@ export class Store {
       CREATE INDEX IF NOT EXISTS messages_space_time ON messages(space_id, created_at);
       CREATE INDEX IF NOT EXISTS messages_reply_to ON messages(reply_to);
       CREATE INDEX IF NOT EXISTS messages_pending_time ON messages(state, updated_at);
+      CREATE TABLE IF NOT EXISTS cr_report_requests (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        state TEXT NOT NULL DEFAULT 'waiting',
+        turn_id TEXT,
+        fallback_message_id TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS cr_report_requests_state ON cr_report_requests(state, updated_at);
       CREATE TABLE IF NOT EXISTS human_message_reads (
         message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
         read_at TEXT NOT NULL
@@ -492,6 +501,11 @@ export class Store {
       .run('Delivery did not complete; check Activity before resending.', now(), cutoff).changes;
   }
 
+  cancelPendingReviewNotification(id, round, recipientId) {
+    return this.db.prepare("UPDATE review_notifications SET state = 'cancelled', updated_at = ? WHERE review_id = ? AND round = ? AND recipient_id = ? AND state = 'pending'")
+      .run(now(), id, round, recipientId).changes > 0;
+  }
+
   recoverAbandonedReviews() {
     // The process may have exited while a snapshot or turn was being started.
     // Never retry automatically: the request might have reached Codex.
@@ -572,8 +586,10 @@ export class Store {
     } catch (failure) { this.db.exec('ROLLBACK'); throw failure; }
   }
 
-  submitReview({id, reviewerId, round, summary, findings, checked = [], unverified = [], freshness}) {
+  submitReview({id, reviewerId, round, summary, findings, checked = [], unverified = [], freshness, humanQuestion = ''}) {
     summary = requiredText(summary, 'Review summary', 4000);
+    if (typeof humanQuestion !== 'string') throw new Error('Human question must be text');
+    humanQuestion = optionalText(humanQuestion, 2000);
     if (!Array.isArray(findings) || findings.length > 80) throw new Error('Provide at most 80 findings');
     if (!Array.isArray(checked) || !Array.isArray(unverified) || checked.length > 30 || unverified.length > 30) throw new Error('Invalid review verification list');
     checked = checked.map(value => requiredText(value, 'Verification', 500));
@@ -616,7 +632,7 @@ export class Store {
       }
       const missing = previous.filter(item => item.status === 'open' && !seen.has(item.id));
       if (missing.length) throw new Error(`Report the status of previous open findings: ${missing.map(item => item.id).join(', ')}`);
-      const result = {summary, checked, unverified, freshness, findings: this.reviewFindings(id)};
+      const result = {summary, checked, unverified, freshness, findings: this.reviewFindings(id), ...(humanQuestion ? {human_question: humanQuestion} : {})};
       const timestamp = now();
       this.db.prepare(`UPDATE review_rounds SET status = 'completed', result_json = ?, updated_at = ? WHERE review_id = ? AND round = ?`)
         .run(JSON.stringify(result), timestamp, id, round);
@@ -627,7 +643,7 @@ export class Store {
         .run(timestamp, currentRound.request_message_id);
       const notify = this.db.prepare(`INSERT INTO review_notifications (review_id, round, recipient_id, state, updated_at) VALUES (?, ?, ?, 'pending', ?)`);
       notify.run(id, round, review.developer_id, timestamp);
-      notify.run(id, round, HUMAN, timestamp);
+      if (humanQuestion) notify.run(id, round, HUMAN, timestamp);
       this.db.exec('COMMIT');
       return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
@@ -652,6 +668,55 @@ export class Store {
 
   setMessageState(id, state, error = null) {
     this.db.prepare('UPDATE messages SET state = ?, error = ?, updated_at = ? WHERE id = ?').run(state, error, now(), id);
+  }
+
+  trackCRRequest(messageId) {
+    this.db.prepare("INSERT OR IGNORE INTO cr_report_requests (message_id, state, updated_at) VALUES (?, 'waiting', ?)").run(messageId, now());
+  }
+
+  pendingCRReports(participantIds = null) {
+    const requests = this.db.prepare(`SELECT m.*, p.developer_id AS report_recipient FROM cr_report_requests c
+      JOIN messages m ON m.id = c.message_id
+      JOIN reviewer_pairs p ON p.space_id = m.space_id AND p.reviewer_id = m.recipient_id AND p.status = 'ready'
+        AND (p.developer_id = m.sender_id OR (m.sender_id = 'human' AND m.reply_to IS NOT NULL))
+      WHERE c.state = 'waiting' AND m.state IN ('queued', 'unknown') ORDER BY m.rowid`).all();
+    return participantIds ? requests.filter(item => participantIds.has(item.sender_id) || participantIds.has(item.recipient_id) || participantIds.has(item.report_recipient)) : requests;
+  }
+
+  crReplyState(request) {
+    const reply = this.db.prepare(`SELECT state FROM messages WHERE space_id = ? AND sender_id = ? AND recipient_id = ?
+      AND (reply_to = ? OR parent_message_id = ?) AND state IN ('queued', 'delivered', 'pending', 'unknown')
+      ORDER BY CASE WHEN state IN ('queued', 'delivered') THEN 0 ELSE 1 END, rowid DESC LIMIT 1`)
+      .get(request.space_id, request.recipient_id, request.report_recipient || request.sender_id, request.id, request.id);
+    if (reply && ['queued', 'delivered'].includes(reply.state)) this.db.prepare("UPDATE cr_report_requests SET state = 'reported', updated_at = ? WHERE message_id = ? AND state = 'waiting'").run(now(), request.id);
+    return reply?.state || null;
+  }
+
+  claimCRFallback(request, turnId) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const pair = this.pairForReviewer(request.space_id, request.recipient_id);
+      if (!pair || pair.status !== 'ready' || (pair.developer_id !== request.sender_id && request.sender_id !== HUMAN) || this.crReplyState(request)) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const result = this.db.prepare("UPDATE cr_report_requests SET state = 'sending', turn_id = ?, updated_at = ? WHERE message_id = ? AND state = 'waiting'")
+        .run(turnId, now(), request.id);
+      this.db.exec('COMMIT');
+      return result.changes > 0;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  finishCRFallback(messageId, state, {fallbackMessageId = null, error = null} = {}) {
+    if (!['reported', 'failed', 'unknown'].includes(state)) throw new Error('Invalid CR report state');
+    this.db.prepare("UPDATE cr_report_requests SET state = ?, fallback_message_id = ?, error = ?, updated_at = ? WHERE message_id = ? AND state = 'sending'")
+      .run(state, fallbackMessageId, error ? String(error).slice(0, 2000) : null, now(), messageId);
+  }
+
+  recoverCRFallbacks() {
+    const cutoff = new Date(Date.now() - 120000).toISOString();
+    return this.db.prepare("UPDATE cr_report_requests SET state = 'unknown', error = ?, updated_at = ? WHERE state = 'sending' AND updated_at < ?")
+      .run('Report delivery is uncertain; check Activity before resending.', now(), cutoff).changes;
   }
 
   recoverStaleDeliveries() {

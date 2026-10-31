@@ -59,6 +59,56 @@ test('activity reuses its pane and preserves the original native session', async
   assert.ok(calls.some(args => args[0] === 'kill-pane' && args.at(-1) === activity));
 });
 
+test('forwards Ctrl+T from the sidebar to the active activity or inbox pane', async () => {
+  const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0', welcomeSpaceId: 'default'});
+  const calls = [];
+  manager.tmux = async args => {
+    calls.push(args);
+    if (args[0] === 'new-window') return '%1';
+    if (args[0] === 'display-message') return '0';
+    return '';
+  };
+  await manager.forwardPanelShortcut('default', 'activity', 'C-t');
+  assert.ok(calls.some(args => args[0] === 'send-keys' && args.includes('%1') && args.at(-1) === 'C-t'));
+  assert.deepEqual(calls.at(-1), ['select-pane', '-t', '%1']);
+  await manager.forwardPanelShortcut('default', 'inbox', 'C-t');
+  assert.ok(calls.some(args => args[0] === 'send-keys' && args.includes('%0') && args.at(-1) === 'C-t'));
+  assert.deepEqual(calls.at(-1), ['select-pane', '-t', '%0']);
+});
+
+test('forwards Ctrl+T from the sidebar to the selected native session', async () => {
+  const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0'});
+  const calls = [];
+  manager.tmux = async args => {
+    calls.push(args);
+    if (args[0] === 'new-window') return '%1';
+    if (args[0] === 'display-message') return '0';
+    return '';
+  };
+  await manager.forwardSessionShortcut(first, '/tmp/server.sock', 'C-t');
+  assert.ok(calls.some(args => args[0] === 'send-keys' && args.includes('%1') && args.at(-1) === 'C-t'));
+  assert.deepEqual(calls.at(-1), ['select-pane', '-t', '%1']);
+});
+
+test('checks a reviewer before opening it without unsupported remote overrides', async () => {
+  const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0'});
+  const calls = [];
+  const reviewer = {...first, space_id: 'default', review_snapshot_path: '/tmp/snapshot'};
+  manager.tmux = async args => {
+    calls.push(args);
+    if (args[0] === 'new-window') return '%1';
+    return '';
+  };
+  manager.prepareReviewer = async member => { assert.equal(member, reviewer); };
+  await manager.show(reviewer, '/tmp/server.sock');
+  const start = calls.find(args => args[0] === 'new-window');
+  assert.ok(start.includes('--remote'));
+  assert.equal(start.some(arg => ['--sandbox', '--ask-for-approval', '--cd'].includes(arg)), false);
+  manager.prepareReviewer = async () => { throw new Error('not read-only'); };
+  await assert.rejects(manager.show(reviewer, '/tmp/server.sock'), /not read-only/);
+  assert.equal(calls.filter(args => args[0] === 'new-window').length, 1);
+});
+
 test('a rapid selection change does not display or type into the wrong session', async () => {
   const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0'});
   const calls = [];

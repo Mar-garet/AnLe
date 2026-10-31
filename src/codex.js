@@ -112,7 +112,7 @@ export class CodexClient {
   close() { this.ws?.close(); }
 }
 
-export async function queueToThread(threadId, text, {readOnly = false, cwd = null} = {}) {
+export async function queueToThread(threadId, text) {
   const client = await CodexClient.connect();
   try {
     const loaded = await client.request('thread/loaded/list');
@@ -120,11 +120,9 @@ export async function queueToThread(threadId, text, {readOnly = false, cwd = nul
       throw new Error('The target session is not connected to the shared Codex server. Open it with codex resume first.');
     }
   } finally { client.close(); }
-  const args = [...(readOnly ? ['--ask-for-approval', 'never'] : []), 'queue', '--thread', threadId, '--message', text];
-  if (readOnly) {
-    args.push('--sandbox', 'read-only');
-    if (cwd) args.push('--cd', cwd);
-  }
+  // A queued message uses the target thread's settings. Newer Codex versions
+  // reject approval, sandbox and working-directory overrides on `queue`.
+  const args = ['queue', '--thread', threadId, '--message', text];
   if (process.env.SEREIN_CODEX_SOCKET) args.push('--remote', `unix://${process.env.SEREIN_CODEX_SOCKET}`);
   const {stdout, stderr} = await exec('codex', args, {
     timeout: 30000,

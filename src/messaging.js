@@ -51,7 +51,12 @@ export async function sendMessage(store, {spaceId, senderId, to, body, replyTo =
   const sender = participant(store, space.id, senderId);
   const recipient = participant(store, space.id, to);
   const pair = store.pairForReviewer(space.id, recipient.id);
+  const senderPair = store.pairForReviewer(space.id, sender.id);
+  let repliedTo = null;
   if (sender.id === recipient.id) throw new Error('Cannot send a message to yourself');
+  if (senderPair && recipient.id === HUMAN && !replyTo && replyExpected !== true) {
+    throw new Error('A CR should contact the human only for a decision; set reply_expected to true for the question');
+  }
   if (reviewContext) {
     if (!pair) throw new Error('Review context can only be sent to a dedicated CR');
     const fields = [['project_background', 'Project background'], ['base_branch', 'Base branch/ref'], ['development_branch', 'Development branch/ref']];
@@ -70,6 +75,7 @@ export async function sendMessage(store, {spaceId, senderId, to, body, replyTo =
     if (!original || original.space_id !== space.id || original.recipient_id !== sender.id || original.sender_id !== recipient.id) {
       throw new Error('The original message was not found or was not addressed to this node');
     }
+    repliedTo = original;
   }
   if (contextMessageId) {
     const context = store.message(contextMessageId);
@@ -78,6 +84,8 @@ export async function sendMessage(store, {spaceId, senderId, to, body, replyTo =
     }
   }
   const message = store.createMessage({spaceId: space.id, sender, recipient, body, replyTo, contextMessageId, replyExpected});
+  if (pair && ((sender.id === pair.developer_id && (replyExpected !== false || repliedTo?.reply_expected === 1)) ||
+      (sender.id === HUMAN && repliedTo?.sender_id === pair.reviewer_id && repliedTo.reply_expected === 1))) store.trackCRRequest(message.id);
   if (recipient.id === HUMAN) return message;
   try {
     const developer = pair && store.member(space.id, pair.developer_id);
@@ -139,7 +147,7 @@ export function welcomeText(space, member, {reviewer = null} = {}) {
     `Use the AnLe MCP tools (registered as serein): list_members to discover members, update_presence to share your current task and status, send_message to send a message, and reply_message to reply. ` +
     `These tools identify this session automatically. This workspace's space_id is ${space.id}.\n` +
     `Before implementing new functionality, look for relevant existing code, callers, project rules, and conventions; reuse an existing solution when its behavior and boundaries fit. If a related responsibility belongs to another workspace member, ask that member when useful. Explain material new abstractions or duplication in your final result. ` +
-    (reviewer ? `Your dedicated reviewer is ${reviewer.name} (session ${reviewer.thread_id}). After meaningful code changes and your own checks, use list_members to discover your CR and send_message to request review without waiting for the human to initiate it. ` +
+    (reviewer ? `Your dedicated reviewer is ${reviewer.name} (session ${reviewer.thread_id}). After meaningful code changes and your own checks, use list_members to discover your CR and send_message with reply_expected=true to request review without waiting for the human to initiate it. ` +
       `Include project background, requirements, the actual base branch/ref and development branch/ref, change scope and verification; supply the review_context fields. Say unknown if a branch is genuinely unclear rather than inventing it. ` +
       `If you just finished relevant work in this session that has not been reviewed, request review when enough context is available; do not attribute other agents' changes to yourself. ` +
       `Assess the CR's findings, fix valid in-scope issues, and use reply_message with reply_expected=true for a re-review, explaining the fixes and any changes to the base or development branch. Limit automatic review to an initial round and one re-review, then involve the human if issues remain. Do not claim a review passed before receiving a result. ` : '') +

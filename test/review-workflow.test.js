@@ -49,9 +49,10 @@ test('independent review keeps the same reviewer and findings across rounds', as
   ]}, {fingerprint: async () => 'hash1', queue: async (thread, text) => deliveries.push({thread, text})});
   assert.equal(first.result.freshness, 'current');
   assert.equal(first.deliveries.developer.state, 'queued');
-  assert.equal(first.deliveries.human.state, 'delivered');
+  assert.equal(first.deliveries.human, undefined);
   assert.equal(deliveries[0].thread, 'dev');
-  assert.match(store.humanInbox()[0].body, /F1 \[P1\]/);
+  assert.match(deliveries[0].text, /F1 \[P1\]/);
+  assert.equal(store.humanInbox().length, 0);
   const next = await continueReview({store, spaceId: 'default', reviewId: started.review.id, initiatorId: 'dev', client}, {snapshot});
   assert.equal(next.reviewer.thread_id, 'review-thread');
   assert.equal(next.review.current_round, 2);
@@ -64,7 +65,7 @@ test('independent review keeps the same reviewer and findings across rounds', as
   const result = await submitReview({store, spaceId: 'default', reviewerId: 'review-thread', reviewId: started.review.id, round: 2, summary: 'Auth added', findings: [{id: 'F1', status: 'resolved', reason: 'The new check rejects missing tokens.'}]}, {fingerprint: async () => 'newer source', queue: async () => {}});
   assert.equal(result.result.freshness, 'stale');
   assert.equal(result.result.findings[0].status, 'resolved');
-  assert.match(store.humanInbox().at(-1).body, /STALE/);
+  assert.match(store.message(result.deliveries.developer.id).body, /STALE/);
   assert.equal(reviewDetails(store, 'default', started.review.id, 'dev').rounds.length, 2);
 });
 
@@ -161,13 +162,13 @@ test('a reviewer that finishes without submitting is reported once, but a discon
   const finished = {request: async () => ({data: [{id: 'turn-1', status: 'completed'}]})};
   await reconcileReviews(store, finished, {queue: async (thread, text) => calls.push({thread, text})});
   assert.equal(store.review(started.review.id).status, 'failed');
-  assert.match(store.humanInbox()[0].body, /finished without submitting/);
+  assert.match(calls[0].text, /finished without submitting/);
   await reconcileReviews(store, finished, {queue: async (thread, text) => calls.push({thread, text})});
   assert.equal(calls.length, 1);
-  assert.equal(store.humanInbox().length, 1);
+  assert.equal(store.humanInbox().length, 0);
 });
 
-test('the human receives the review when developer delivery fails', async t => {
+test('developer delivery failure remains visible without sending an ordinary result to the human', async t => {
   const {store, client, snapshot} = fixture(t);
   const started = await startReview({store, spaceId: 'default', developerId: 'dev', goal: 'Review', client}, {snapshot});
   let attempts = 0;
@@ -176,16 +177,38 @@ test('the human receives the review when developer delivery fails', async t => {
     queue: async () => { attempts++; throw new Error('Development session is offline'); },
   });
   assert.equal(result.deliveries.developer.state, 'failed');
-  assert.equal(result.deliveries.human.state, 'delivered');
-  assert.match(store.humanInbox()[0].body, /Developer delivery: FAILED/);
+  assert.equal(result.deliveries.human, undefined);
+  assert.equal(store.humanInbox().length, 0);
+  assert.equal(store.message(result.deliveries.developer.id).state, 'failed');
   await reconcileReviews(store, client, {queue: async () => { attempts++; }});
   assert.equal(attempts, 1, 'failed delivery must not be silently resent');
+});
+
+test('only a question requiring a human decision is sent to the inbox', async t => {
+  const {store, client, snapshot} = fixture(t);
+  const started = await startReview({store, spaceId: 'default', developerId: 'dev', goal: 'Review', client}, {snapshot});
+  const result = await submitReview({store, spaceId: 'default', reviewerId: 'review-thread', reviewId: started.review.id, round: 1, summary: 'Needs a decision', findings: [], humanQuestion: 'Should this endpoint be public?'}, {fingerprint: async () => 'hash1', queue: async () => {}});
+  assert.equal(result.deliveries.developer.state, 'queued');
+  assert.equal(result.deliveries.human.state, 'delivered');
+  assert.match(store.humanInbox()[0].body, /Should this endpoint be public/);
+  assert.equal(store.humanInbox()[0].reply_expected, 1);
+});
+
+test('old pending human notifications without a question are cancelled', async t => {
+  const {store, client, snapshot} = fixture(t);
+  const started = await startReview({store, spaceId: 'default', developerId: 'dev', goal: 'Review', client}, {snapshot});
+  store.submitReview({id: started.review.id, reviewerId: 'review-thread', round: 1, summary: 'No findings', findings: [], freshness: 'current'});
+  store.db.prepare("INSERT INTO review_notifications (review_id, round, recipient_id, state, updated_at) VALUES (?, 1, 'human', 'pending', ?)")
+    .run(started.review.id, new Date().toISOString());
+  await reconcileReviews(store, {request: async () => ({data: []})}, {queue: async () => {}});
+  assert.equal(store.humanInbox().length, 0);
+  assert.equal(store.reviewNotifications(started.review.id, 1).find(item => item.recipient_id === 'human').state, 'cancelled');
 });
 
 test('completed review notifications recover after a crash without duplicating uncertain sends', async t => {
   const {store, client, snapshot} = fixture(t);
   const started = await startReview({store, spaceId: 'default', developerId: 'dev', goal: 'Review', client}, {snapshot});
-  store.submitReview({id: started.review.id, reviewerId: 'review-thread', round: 1, summary: 'No issues', findings: [], freshness: 'current'});
+  store.submitReview({id: started.review.id, reviewerId: 'review-thread', round: 1, summary: 'Need a decision', findings: [], freshness: 'current', humanQuestion: 'Which policy should apply?'});
   const queued = [];
   const quiet = {request: async () => ({data: []})};
   await reconcileReviews(store, quiet, {queue: async (thread, text) => queued.push({thread, text})});
@@ -196,7 +219,7 @@ test('completed review notifications recover after a crash without duplicating u
   assert.equal(store.humanInbox().length, 1);
 
   await continueReview({store, spaceId: 'default', reviewId: started.review.id, initiatorId: 'dev', client}, {snapshot});
-  store.submitReview({id: started.review.id, reviewerId: 'review-thread', round: 2, summary: 'Second round', findings: [], freshness: 'current'});
+  store.submitReview({id: started.review.id, reviewerId: 'review-thread', round: 2, summary: 'Second round', findings: [], freshness: 'current', humanQuestion: 'Which policy should apply now?'});
   assert.equal(store.claimReviewNotification(started.review.id, 2, 'dev'), true);
   store.db.prepare("UPDATE review_notifications SET updated_at = '2020-01-01T00:00:00.000Z' WHERE review_id = ? AND round = 2 AND recipient_id = 'dev'").run(started.review.id);
   await reconcileReviews(store, quiet, {queue: async (thread, text) => queued.push({thread, text})});

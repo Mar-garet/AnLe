@@ -20,7 +20,7 @@ function fixture(t) {
     if (method === 'thread/start') return {thread: {id: `cr-${++count}`}};
     if (method === 'thread/name/set') return {};
     if (method === 'thread/read') return {thread: {id: params.threadId, cwd: '/repo/backend', status: {type: status}}};
-    if (method === 'thread/resume') { status = 'idle'; return {thread: {id: params.threadId}}; }
+    if (method === 'thread/resume') { status = 'idle'; return {thread: {id: params.threadId}, sandbox: {type: 'readOnly'}, approvalPolicy: 'never'}; }
     throw new Error(`Unexpected ${method}`);
   }};
   t.after(() => { store.close(); rmSync(dir, {recursive: true, force: true}); });
@@ -75,6 +75,15 @@ test('ordinary messages carry explicit project and branch context to the assigne
   await assert.rejects(sendMessage(store, {spaceId: 'default', senderId: 'dev', to: 'backend CR', body: 'Review', reviewContext: {project_background: 'API', base_branch: 'main'}}, async () => {}), /Development branch/);
 });
 
+test('a CR contacts the human only for a question requiring a reply', async t => {
+  const {store, client} = fixture(t);
+  await ensureReviewerPair({store, spaceId: 'default', developerId: 'dev', client});
+  await assert.rejects(sendMessage(store, {spaceId: 'default', senderId: 'cr-1', to: 'human', body: 'No findings', replyExpected: false}, async () => {}), /only for a decision/);
+  const question = await sendMessage(store, {spaceId: 'default', senderId: 'cr-1', to: 'human', body: 'Should guests be allowed?', replyExpected: true}, async () => {});
+  assert.equal(question.state, 'delivered');
+  assert.equal(store.humanInbox().length, 1);
+});
+
 test('restarts an offline CR with read-only policy and its preset', async t => {
   const {store, client, calls, setStatus} = fixture(t);
   await ensureReviewerPair({store, spaceId: 'default', developerId: 'dev', client});
@@ -84,6 +93,16 @@ test('restarts an offline CR with read-only policy and its preset', async t => {
   assert.equal(resume.sandbox, 'read-only');
   assert.equal(resume.approvalPolicy, 'never');
   assert.match(resume.developerInstructions, /Dedicated CR/);
+});
+
+test('refuses to queue a review if the loaded CR has a writable sandbox', async t => {
+  const {store, client} = fixture(t);
+  await ensureReviewerPair({store, spaceId: 'default', developerId: 'dev', client});
+  const request = client.request;
+  client.request = async (method, params) => method === 'thread/resume'
+    ? {thread: {id: params.threadId}, sandbox: {type: 'workspaceWrite'}}
+    : request(method, params);
+  await assert.rejects(prepareReviewer(client, store, 'default', 'cr-1'), /not confirmed read-only/);
 });
 
 test('renaming and removing a coding node keeps its CR pair consistent', async t => {
