@@ -32,6 +32,33 @@ test('native panes are reused when switching sessions and receive input literall
   assert.deepEqual(calls.at(-1), ['select-pane', '-t', '%1']);
 });
 
+test('activity reuses its pane and preserves the original native session', async () => {
+  const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0', welcomeSpaceId: 'default'});
+  const calls = [];
+  let nextPane = 1;
+  manager.tmux = async args => {
+    calls.push(args);
+    if (args[0] === 'new-window') return `%${nextPane++}`;
+    if (args[0] === 'display-message') return '0';
+    return '';
+  };
+  await manager.show(first, '/tmp/server.sock');
+  const original = manager.visiblePane;
+  await manager.showActivity('default');
+  const activity = manager.visiblePane;
+  assert.notEqual(activity, original);
+  await manager.discardActivity('default');
+  assert.equal(calls.some(args => args[0] === 'kill-pane'), false);
+  await manager.show(first, '/tmp/server.sock');
+  assert.equal(manager.visiblePane, original);
+  await manager.showActivity('default');
+  assert.equal(manager.visiblePane, activity);
+  assert.equal(calls.filter(args => args[0] === 'new-window').length, 2);
+  await manager.show(first, '/tmp/server.sock');
+  await manager.discardActivity('default');
+  assert.ok(calls.some(args => args[0] === 'kill-pane' && args.at(-1) === activity));
+});
+
 test('a rapid selection change does not display or type into the wrong session', async () => {
   const manager = new NativePaneManager({socketName: 'test', session: 'workspace', welcomePane: '%0'});
   const calls = [];

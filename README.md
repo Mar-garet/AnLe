@@ -15,6 +15,7 @@ AnLe is a local terminal console that connects existing Codex CLI sessions and a
  │ api                     BUSY ││                                         │
  │ F6 list · F7 Codex           ││  › Ask Codex to do anything             │
  └──────────────────────────────┘└─────────────────────────────────────────┘
+ ── ● FOCUSED ───────────────────┴── ○ INACTIVE ──────────────────────────
 ```
 
 ## Getting started
@@ -38,10 +39,16 @@ On first use, press `Ctrl+S` to connect AnLe MCP. This adds `mcp_servers.serein`
 2. Press `Ctrl+A` in AnLe, select an existing session, and give the node a name and role. Press `/` to search sessions by name, directory, or ID. Sessions already in the workspace are marked `ADDED`. Joining queues an introduction in the original session.
 3. Add the other sessions. You are the `human` participant in the workspace.
 4. Click a session in the sidebar, or focus it and use the arrow keys or mouse wheel. Its native Codex CLI opens on the right; press `Enter` or `F7` to focus it, or start typing to send the first character and focus it automatically. Use the CLI's normal input, slash commands, approval prompts, and scrolling. Click the sidebar or press `F6` to return to it.
-5. Click `human / inbox` to see your messages in the main panel. An and Le stay visible alongside the inbox and message details, using smaller portraits when the pane is narrow. Select a message, type your reply in the visible input, and press `Enter` to send it to that agent. You can start typing with the sidebar focused; the input moves to the inbox automatically. Press `Enter` with an empty input to open the full message. `Ctrl+N` also opens the inbox from the sidebar.
+5. Click `human / inbox` to see messages from all workspaces in the main panel. Each message shows its workspace, and a reply returns to the original sender in that workspace. An and Le stay visible alongside the inbox and message details, using smaller portraits when the pane is narrow. Select a message, type your reply in the visible input, and press `Enter` to send it. Press `Enter` with an empty input to open the full message. `Ctrl+N` opens the inbox and selects the newest unread message.
 6. In an original Codex session, you can also ask an agent to find and contact another workspace member directly.
 
-The sidebar and the `Ctrl+A` session picker show each session's full working directory above its name. Paths are highlighted, with the selected session's path in a different color. Long paths wrap onto additional lines; sessions from the same directory remain separate entries. Use `Page Up` / `Page Down` to scroll through a list or path that exceeds the available height.
+The highlighted `FOCUSED` label below a column shows where keyboard input will go; it follows mouse clicks and keyboard focus changes. The sidebar and the `Ctrl+A` session picker show each session's full working directory above its name. The selected session's path and name are highlighted. Long paths wrap onto additional lines; sessions from the same directory remain separate entries. Use `Page Up` / `Page Down` to scroll through a list or path that exceeds the available height.
+
+Select an agent in the sidebar and press `Ctrl+O` to inspect its role, directory, reported task and status, and the time it last updated that report. `Ctrl+E` edits its name and role. Agents update their own task and status through `update_presence`; the information is self-reported and may be out of date. The separate Codex status is the last observation made by the running console; after 20 seconds without a refresh, discovery reports it as unknown.
+
+The inbox shows unread and open counts across workspaces. Reading a message does not mark it answered. With the inbox focused, `Ctrl+T` filters to open messages; `Ctrl+D` marks the selected message done or undoes that action. Questions with an explicit reply request show `NEEDS REPLY`; older messages and messages without a stated expectation show `UNREPLIED` until answered or marked done. Informational updates can be sent without requesting a reply.
+
+From the sidebar, `Ctrl+V` opens the current workspace's activity in the right pane, including delivery and reply status. Focus that pane and press `Ctrl+T` to group related messages into conversations; select one and press `Enter` to inspect its timeline. In the activity or timeline view, `Ctrl+O` opens the selected message's sender and `Ctrl+P` opens its recipient in the native session. Press `Esc` to return from a timeline, or `F6` and `Ctrl+V` to return to the selected session. `Ctrl+U` enables or disables optional desktop alerts for newly received human messages while AnLe is running. Alerts are off by default and the preference is stored locally. macOS uses Notification Center; Linux requires `notify-send`. Alerts do not run after AnLe exits.
 
 | Key | Action |
 | --- | --- |
@@ -50,11 +57,16 @@ The sidebar and the `Ctrl+A` session picker show each session's full working dir
 | `F6` / `F7` | Focus the workspace sidebar / the Codex pane |
 | `Tab` / `Esc` | Change focus or close a message within the sidebar |
 | `Ctrl+N` / `Ctrl+V` | Open your inbox / switch between the selected node and collaboration activity |
+| `Ctrl+O` | In the sidebar: inspect the selected agent's profile |
+| `Ctrl+T` / `Enter` | In activity: toggle conversation groups / open the selected timeline |
+| `Ctrl+O` / `Ctrl+P` | In activity: open the selected message's sender / recipient |
+| `Ctrl+T` / `Ctrl+D` | In the inbox: filter open messages / mark the selected message done or undo |
+| `Ctrl+U` | Toggle desktop alerts from the sidebar |
 | `Page Up` / `Page Down` | Scroll within the focused Codex session or message |
 | `Ctrl+A` | Add a session |
 | `Ctrl+E` / `Ctrl+L` / `Ctrl+X` | Edit a node / resend its introduction / remove it |
 | `Ctrl+G` / `Ctrl+W` | Switch / create a workspace |
-| `Ctrl+D` | Delete the current workspace after confirmation |
+| `Ctrl+D` | In the sidebar: delete the current workspace after confirmation |
 | `Ctrl+S` | Connect or update the local AnLe MCP configuration |
 | `Ctrl+R` / `Ctrl+P` / `Ctrl+Q` | Refresh or reconnect / help / quit |
 
@@ -62,11 +74,15 @@ To remove just one session, select it and press `Ctrl+X`. To delete a whole work
 
 ## How messaging works
 
-The AnLe MCP server exposes `list_members`, `send_message`, and `reply_message`. Codex supplies the calling session ID in MCP metadata, and AnLe only allows sessions registered in that workspace to use these tools. An agent can continue working after it sends a message; a reply is queued in its original session.
+The AnLe MCP server exposes `list_members`, `update_presence`, `send_message`, `reply_message`, `get_message_status`, and `get_conversation`. Codex supplies the calling session ID in MCP metadata, and AnLe only allows sessions registered in that workspace to use these tools. `list_members` includes each agent's role, directory, self-reported task and task status, update time, and last observed Codex status. `update_presence` changes only the calling agent's report.
+
+An agent can continue working after it sends a message; a reply is queued in its original session. Agents can set `reply_expected` for questions or informational updates; if omitted, the expectation remains unspecified. A direct reply automatically stays in the original conversation. When asking another participant about an existing message, the agent passes that message's ID as `context_message_id` so the new question joins the same conversation. Only messages explicitly linked this way are grouped; unrelated messages are not inferred to be related. The console shows the whole workspace conversation, while `get_conversation` returns only messages sent or received by the calling session. Status lookup is limited to the message's sender and recipient.
+
+The equivalent CLI commands include `anle presence --task "Implementing login" --status working`, `anle send --to human --message "Which policy?" --context-message MESSAGE_ID --reply-expected true`, and `anle conversation --message-id MESSAGE_ID`. Run them from a registered Codex session, with `CODEX_THREAD_ID` identifying that session.
 
 Messages to an agent are delivered through `codex queue` and appear as inputs marked `[AnLe · …]` in the original CLI session. The sender also shows the message and tool call in its session. Each session continues to follow its own instructions and permissions when handling another agent's message.
 
-**QUEUED** means Codex accepted the message; it does not mean the recipient has processed or answered it. Messages to `human` appear in the inbox, with an unread count that remains until you open or reply to them. Failed or uncertain deliveries remain in the message history.
+**QUEUED** means Codex accepted the message; it does not mean the recipient has read or processed it. **REPLIED** means a correlated reply was delivered to the human inbox or accepted into the other session's queue; it does not mean that reply has been read. **FAILED** and **UNKNOWN** remain visible. An interrupted send whose outcome cannot be established becomes `UNKNOWN`, and AnLe does not automatically resend it. Questions and messages with an unspecified reply expectation remain open until they are answered or marked done, independently of their unread state.
 
 ## Current scope
 
@@ -84,6 +100,6 @@ Messages to an agent are delivered through `codex queue` and appear as inputs ma
 npm test
 ```
 
-The automated tests cover native pane switching, mouse and keyboard navigation, inbox replies to the selected agent, history pagination, filtered conversation rendering, scrollbar interaction, inline text editing, inbox read markers, message routing, delivery failures, and identification of the calling session from MCP metadata.
+The automated tests cover native pane switching, mouse and keyboard navigation, agent presence, conversation linking and navigation, cross-workspace inbox replies, message delivery and reply states, optional notification settings, history pagination, filtered conversation rendering, scrollbar interaction, inline text editing, and identification of the calling session from MCP metadata.
 
 The pet sprite source is `assets/an-le-pixel.png`. Run `python3 scripts/build-pet-art.py` to regenerate its terminal color grids; the console does not need Python at runtime.

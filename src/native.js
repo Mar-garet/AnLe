@@ -23,6 +23,7 @@ export class NativePaneManager {
     this.visiblePane = welcomePane;
     this.panes = new Map();
     this.inboxes = new Map(welcomeSpaceId ? [[welcomeSpaceId, welcomePane]] : []);
+    this.activities = new Map();
     this.desired = null;
     this.worker = null;
     this.env = tmuxEnvironment();
@@ -34,7 +35,15 @@ export class NativePaneManager {
   }
 
   show(member, serverSocket, spaceId) {
-    this.desired = member ? {member, serverSocket} : {spaceId};
+    return this.schedule(member ? {member, serverSocket} : {spaceId});
+  }
+
+  showActivity(spaceId) {
+    return this.schedule({spaceId, activity: true});
+  }
+
+  schedule(desired) {
+    this.desired = desired;
     if (!this.worker) {
       this.worker = this.update().finally(() => { this.worker = null; });
     }
@@ -45,7 +54,8 @@ export class NativePaneManager {
     while (true) {
       const desired = this.desired;
       try {
-        const pane = desired.member ? await this.ensurePane(desired.member, desired.serverSocket) : await this.ensureInboxPane(desired.spaceId);
+        const pane = desired.member ? await this.ensurePane(desired.member, desired.serverSocket) :
+          desired.activity ? await this.ensureActivityPane(desired.spaceId) : await this.ensureInboxPane(desired.spaceId);
         if (this.desired !== desired) continue;
         if (pane !== this.visiblePane) {
           await this.tmux(['swap-pane', '-d', '-s', pane, '-t', this.visiblePane]);
@@ -90,6 +100,20 @@ export class NativePaneManager {
     return pane;
   }
 
+  async ensureActivityPane(spaceId) {
+    let pane = this.activities.get(spaceId);
+    const command = ['env', `ANLE_CONSOLE_ID=${this.socketName}`, process.execPath, '--disable-warning=ExperimentalWarning', binPath, '__native_activity', spaceId];
+    if (!pane) {
+      pane = await this.tmux(['new-window', '-d', '-t', `${this.session}:`, '-P', '-F', '#{pane_id}', ...command]);
+      if (!/^%\d+$/.test(pane)) throw new Error('Could not open activity.');
+      this.activities.set(spaceId, pane);
+    } else {
+      const dead = await this.tmux(['display-message', '-p', '-t', pane, '#{pane_dead}']);
+      if (dead === '1') await this.tmux(['respawn-pane', '-k', '-t', pane, ...command]);
+    }
+    return pane;
+  }
+
   async discardInbox(spaceId) {
     const pane = this.inboxes.get(spaceId);
     if (!pane || pane === this.visiblePane) return;
@@ -97,20 +121,36 @@ export class NativePaneManager {
     this.inboxes.delete(spaceId);
   }
 
-  async focusInbox(spaceId) {
+  async discardActivity(spaceId) {
+    const pane = this.activities.get(spaceId);
+    if (!pane || pane === this.visiblePane) return;
+    await this.tmux(['kill-pane', '-t', pane]);
+    this.activities.delete(spaceId);
+  }
+
+  async focusActivity(spaceId) {
+    await this.showActivity(spaceId);
+    const pane = this.activities.get(spaceId);
+    if (!this.desired?.activity || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
+    await this.tmux(['select-pane', '-t', pane]);
+  }
+
+  async focusInbox(spaceId, {selectNewest = false} = {}) {
     await this.show(null, undefined, spaceId);
     const pane = this.inboxes.get(spaceId);
-    if (this.desired?.member || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
+    if (this.desired?.member || this.desired?.activity || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
+    if (selectNewest) await this.tmux(['send-keys', '-t', pane, 'C-n']);
+    if (this.desired?.member || this.desired?.activity || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
     await this.tmux(['select-pane', '-t', pane]);
   }
 
   async forwardInbox(spaceId, value, paste = false) {
     await this.show(null, undefined, spaceId);
     const pane = this.inboxes.get(spaceId);
-    if (this.desired?.member || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
+    if (this.desired?.member || this.desired?.activity || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed.');
     const text = paste ? `\x1b[200~${value}\x1b[201~` : value;
     await this.tmux(['send-keys', '-t', pane, '-l', '--', text]);
-    if (this.desired?.member || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed; input remains in its inbox.');
+    if (this.desired?.member || this.desired?.activity || this.desired?.spaceId !== spaceId || pane !== this.visiblePane) throw new Error('The selected workspace changed; input remains in its inbox.');
     await this.tmux(['select-pane', '-t', pane]);
   }
 
@@ -158,6 +198,14 @@ export async function startNativeConsole() {
     await tmux(['set-option', '-g', 'status', 'off']);
     await tmux(['set-option', '-g', 'mouse', 'on']);
     await tmux(['set-window-option', '-g', 'remain-on-exit', 'on']);
+    // Let tmux mark the actual active pane, including mouse and keyboard focus
+    // changes, without changing the native Codex interface inside the pane.
+    await tmux(['set-window-option', '-t', left, 'pane-border-status', 'bottom']);
+    await tmux(['set-window-option', '-t', left, 'pane-active-border-style', 'fg=colour166']);
+    await tmux(['set-window-option', '-t', left, 'pane-border-style', 'fg=colour244']);
+    await tmux(['set-window-option', '-t', left, 'pane-border-format', '#{?pane_active,#[fg=colour16]#[bg=colour214]#[bold]  ● FOCUSED  #[default],#[fg=colour244]  ○ INACTIVE  #[default]}']);
+    // Older tmux versions may not support arrows; the focus labels still work.
+    await tmux(['set-window-option', '-t', left, 'pane-border-indicators', 'arrows']).catch(() => {});
     // tmux normally distributes a terminal resize across both panes. Keep the
     // workspace usable when a large terminal is subsequently made smaller.
     await tmux(['set-hook', '-w', '-t', left, 'window-resized', `resize-pane -t ${left} -x ${sidebar}`]);
