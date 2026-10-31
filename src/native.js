@@ -72,9 +72,11 @@ export class NativePaneManager {
   async ensurePane(member, serverSocket) {
     let pane = this.panes.get(member.thread_id);
     const command = ['codex', 'resume', member.thread_id, '--remote', `unix://${serverSocket}`];
+    if (member.review_snapshot_path) command.push('--sandbox', 'read-only', '--ask-for-approval', 'never', '--cd', member.review_snapshot_path);
     if (!pane) {
       const args = ['new-window', '-d', '-t', `${this.session}:`, '-P', '-F', '#{pane_id}'];
-      if (member.cwd && existsSync(member.cwd)) args.push('-c', member.cwd);
+      const cwd = member.review_snapshot_path || member.cwd;
+      if (cwd && existsSync(cwd)) args.push('-c', cwd);
       pane = await this.tmux([...args, ...command]);
       if (!/^%\d+$/.test(pane)) throw new Error('Could not open the native Codex pane.');
       this.panes.set(member.thread_id, pane);
@@ -203,7 +205,7 @@ export async function startNativeConsole() {
     await tmux(['set-window-option', '-t', left, 'pane-border-status', 'bottom']);
     await tmux(['set-window-option', '-t', left, 'pane-active-border-style', 'fg=colour166']);
     await tmux(['set-window-option', '-t', left, 'pane-border-style', 'fg=colour244']);
-    await tmux(['set-window-option', '-t', left, 'pane-border-format', '#{?pane_active,#[fg=colour16]#[bg=colour214]#[bold]  ● FOCUSED  #[default],#[fg=colour244]  ○ INACTIVE  #[default]}']);
+    await tmux(['set-window-option', '-t', left, 'pane-border-format', '#{?pane_active,#[fg=colour16]#[bg=colour214]#[bold]  ■ FOCUSED  #[default],#[fg=colour244]  □ INACTIVE  #[default]}']);
     // Older tmux versions may not support arrows; the focus labels still work.
     await tmux(['set-window-option', '-t', left, 'pane-border-indicators', 'arrows']).catch(() => {});
     // tmux normally distributes a terminal resize across both panes. Keep the

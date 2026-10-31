@@ -126,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
             raise AssertionError(f'{label}\n{screen}')
 
         def find_socket():
-            matches = list(tmux_temp.glob(f'tmux-*/serein-{proc.pid}-*'))
+            matches = [path for path in tmux_temp.glob(f'tmux-*/serein-{proc.pid}-*') if path.is_socket()]
             return matches[0].name if matches else None
 
         until(lambda: find_socket() is not None, 'private tmux server did not start')
@@ -136,7 +136,13 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
             return subprocess.run(['tmux', '-L', socket, *args], env=env, check=True,
                                   capture_output=True, text=True).stdout.strip()
 
-        until(lambda: len(tmux('list-panes', '-t', 'workspace:0').splitlines()) == 2, 'panes did not start')
+        def panes_started():
+            try:
+                return len(tmux('list-panes', '-t', 'workspace:0').splitlines()) == 2
+            except subprocess.CalledProcessError:
+                return False
+
+        until(panes_started, 'panes did not start')
         left = tmux('list-panes', '-t', 'workspace:0', '-F', '#{pane_id}').splitlines()[0]
 
         def sidebar():
@@ -172,12 +178,10 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
             return color
 
         def dogs_visible():
-            lines = native_screen().splitlines()
-            for index, line in enumerate(lines):
-                if re.search(r'\bAn\s+Le\b', line):
-                    art = lines[max(0, index - 12):index]
-                    return sum(bool(re.search(r'[▀▄█]{3}', row)) for row in art) >= 3
-            return False
+            return any(re.search(r'[▄▀█]{2}.*[▄▀█]{2}', line) for line in native_screen().splitlines())
+
+        def dog_picture():
+            return tuple(line[-26:] for line in native_screen().splitlines() if re.search(r'[▄▀█]{2}', line))
 
         def send(data):
             os.write(master, data)
@@ -216,7 +220,9 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: tmux('display-message', '-p', '-t', left, '#{mouse_any_flag}') == '1', 'sidebar did not enable mouse reporting')
         until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen() and 'Reply to backend' in native_screen(), 'human inbox and reply input did not render')
         until(dogs_visible, 'the dogs disappeared when messages arrived')
-        assert '█▀▀▀▀▀█        █▀▀▀▀▀█' not in native_screen(), 'speech bubbles should not appear above the dogs'
+        first_dog_picture = dog_picture()
+        until(lambda: dog_picture() and dog_picture() != first_dog_picture, 'the dogs did not animate')
+        assert '▛' in native_screen() and '▜' in native_screen(), 'pixel panel corners did not render'
         # Capture the entire tmux display in an isolated outer terminal, so the
         # visible focus labels (which are outside both panes) are exercised too.
         observer_socket = f'focus-view-{proc.pid}'
@@ -231,9 +237,9 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
                 lines = observer('capture-pane', '-p', '-t', viewer).splitlines()
                 return lines[-1] if lines else ''
             def left_focused():
-                return bool(re.search(r'● FOCUSED.*○ INACTIVE', focus_line()))
+                return bool(re.search(r'■ FOCUSED.*□ INACTIVE', focus_line()))
             def right_focused():
-                return bool(re.search(r'○ INACTIVE.*● FOCUSED', focus_line()))
+                return bool(re.search(r'□ INACTIVE.*■ FOCUSED', focus_line()))
             until(left_focused, 'left focus label did not appear')
             focus_colors = observer('capture-pane', '-p', '-e', '-t', viewer).splitlines()[-1]
             assert '\x1b[48;5;214m' in focus_colors, 'focused label did not have its visible background'
@@ -403,7 +409,7 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         click_message('Backend needs review')
         until(lambda: 'Reply to backend · My Workspace' in native_screen(), 'clicking the default-workspace question did not select its destination')
         send(b'backend reply')
-        until(lambda: 'backend reply' in native_screen() and dogs_visible(), 'dogs or reply text disappeared while typing')
+        until(lambda: 'backend reply' in native_screen() and dogs_visible(), 'the dogs or reply text disappeared while typing')
         send(b'\r')
         until(lambda: len(replies()) == 2 and replies()[-1][2] == 'backend reply' and replies()[-1][4] == 'queued', 'reply was not queued')
         backend_reply = replies()[-1]
@@ -435,35 +441,38 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: 'Need your decision' in native_screen(), 'all inbox messages did not return')
         click_message('Need your decision')
         until(lambda: 'Reply to frontend' in native_screen(), 'could not reselect the frontend message')
-        until(dogs_visible, 'the dogs disappeared after replying')
-        send(b'\x1b[<0;190;7M\x1b[<0;190;7m')
+        send(b'\x1b[<0;200;7M\x1b[<0;200;7m')
         until(lambda: 'Reply to frontend' in native_screen(), 'clicking the dogs changed the selected message')
         send(b'\r')
         until(lambda: 'MESSAGE DETAILS' in native_screen() and 'DETAIL END' in native_screen() and dogs_visible(), 'the dogs or wrapped message were missing from message details')
         send(b'\x1b')
         until(lambda: 'YOUR INBOX' in native_screen(), 'message details did not close')
-        # The small portraits remain visible and replies usable in a narrow pane.
+        # Messages and replies remain usable in a narrow pane.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 64, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
-        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and '▄▀▀▀▄ █▄▄▄█' in native_screen() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'narrow inbox did not retain the dogs alongside messages and reply input')
+        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and dogs_visible() and '^T open ^D done' in native_screen() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'narrow inbox did not retain the dogs, controls, messages and reply input')
         assert re.search(r'\d\d:\d\d\s+frontend\s+REPLIED', native_screen()), 'the frontend sender was clipped in a narrow inbox'
         assert re.search(r'\d\d:\d\d\s+backend\s+REPLIED', native_screen()), 'the backend sender was clipped in a narrow inbox'
         if os.environ.get('SEREIN_SIDEBAR_DUMP'):
             print(native_screen(), flush=True)
         send(b'x')
-        until(lambda: '› x' in native_screen() and '▄▀▀▀▄ █▄▄▄█' in native_screen(), 'narrow inbox did not retain the dogs while typing')
+        until(lambda: '› x' in native_screen() and dogs_visible() and 'Need your decision' in native_screen(), 'narrow inbox lost the dogs or messages while typing')
         send(b'\x7f')
         send(b'\r')
-        until(lambda: 'MESSAGE' in native_screen() and 'DETAIL END' in native_screen() and '▄▀▀▀▄ █▄▄▄█' in native_screen() and 'Reply to frontend' in native_screen(), 'narrow message details did not retain the dogs and full text')
+        until(lambda: 'MESSAGE' in native_screen() and 'DETAIL END' in native_screen() and dogs_visible() and 'Reply to frontend' in native_screen(), 'narrow message details did not retain the dogs, full text and reply input')
         send(b'\x1b')
         until(lambda: 'YOUR INBOX' in native_screen(), 'narrow message details did not close')
         # A short terminal still leaves space for both messages and the composer.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 208, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
-        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '17' and dogs_visible() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'short inbox hid the dogs or reply input')
+        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '17' and dogs_visible() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'short inbox hid the dogs, a message or reply input')
+        # An even shorter pane keeps the same dogs visible beside the messages.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 16, 208, 0, 0))
+        os.kill(client_pid, signal.SIGWINCH)
+        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '15' and dogs_visible() and 'Need your decision' in native_screen() and 'Reply to frontend' in native_screen(), 'very short inbox hid the dogs or reply input')
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 208, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
-        until(lambda: dogs_visible() and 'YOUR INBOX' in native_screen(), 'full dogs did not return after widening the pane')
+        until(lambda: 'YOUR INBOX' in native_screen() and 'Need your decision' in native_screen(), 'inbox did not return after widening the pane')
         # Return to the sidebar, click human and type directly without another shortcut.
         send(b'\x1b[17~')
         send(b'\x1b[<0;8;7M\x1b[<0;8;7m')
@@ -502,6 +511,25 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 208, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
         until(lambda: tmux('display-message', '-p', '-t', left, '#{pane_height}') == '17' and 'Pg scroll' in sidebar(), 'short sidebar did not show its scroll hint')
+        send(b'\x10')
+        until(lambda: 'SHORTCUTS  1-6/21' in sidebar() and 'Ctrl+N  Open inbox' in sidebar(), 'short sidebar help did not open')
+        if os.environ.get('SEREIN_SIDEBAR_DUMP'):
+            print(sidebar(), flush=True)
+        seen_shortcuts = set()
+        for _ in range(6):
+            for line in sidebar().splitlines():
+                shortcuts = re.findall(r'Ctrl\+[A-Z]', line)
+                assert len(shortcuts) <= 1, 'a help row contained multiple shortcuts'
+                seen_shortcuts.update(shortcuts)
+            if 'Ctrl+Q' in seen_shortcuts:
+                break
+            send(b'\x1b[6~')
+        expected_shortcuts = {f'Ctrl+{key}' for key in 'NVOKYAXELGWDURSPQ'}
+        assert expected_shortcuts <= seen_shortcuts, 'paging skipped shortcuts in the short sidebar'
+        send(b'\x1b[5~')
+        until(lambda: 'Ctrl+G  Switch workspace' in sidebar() and 'Ctrl+Q' not in sidebar(), 'Page Up did not move back through shortcuts')
+        send(b'\x1b')
+        until(lambda: 'human / inbox' in sidebar(), 'short sidebar help did not close')
         send(b'\x1b[B')
         until(lambda: selected('frontend'), 'could not select an agent in the short sidebar')
         send(b'\x0f')
@@ -555,18 +583,20 @@ with tempfile.TemporaryDirectory(prefix='serein-terminal-', dir='/tmp') as direc
         until(lambda: db.execute('SELECT name FROM spaces').fetchall() == [('New Workspace',)], 'empty replacement workspace was not created')
         until(lambda: selected('human') and 'DELETE WORKSPACE' not in sidebar(), 'replacement workspace did not appear')
         assert 'New Workspace' not in sidebar(), 'workspace name should not appear below the wordmark'
-        until(lambda: 'No messages for you yet.' in native_screen() and dogs_visible(), 'short empty inbox did not show An and Le')
-        # A taller terminal shows the full pair without speech bubbles.
+        until(lambda: 'No messages for you yet.' in native_screen() and dogs_visible(), 'short empty inbox did not show the dogs')
+        # The empty state remains small and legible as the terminal grows.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 208, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
-        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '29' and dogs_visible() and 'No messages for you yet.' in native_screen(), 'full empty inbox did not show An and Le')
-        assert '█▀▀▀▀▀█        █▀▀▀▀▀█' not in native_screen(), 'speech bubbles should not appear above the dogs'
-        colored_pet = tmux('capture-pane', '-p', '-e', '-t', native_pane())
-        assert '\x1b[38;5;' in colored_pet and '\x1b[48;5;' in colored_pet, 'the pixel pets did not retain their colors'
-        # A narrow pane keeps both dogs and the caption visible.
+        until(lambda: tmux('display-message', '-p', '-t', native_pane(), '#{pane_height}') == '29' and dogs_visible() and 'No messages for you yet.' in native_screen(), 'full empty inbox did not show the dogs')
+        colored_screen = tmux('capture-pane', '-p', '-e', '-t', native_pane())
+        dog_line = next(line for line in colored_screen.splitlines() if '▄▀▀▀▄' in line and '█▄▄▄█' in line)
+        an_color = foreground_at(dog_line, '▄▀▀▀▄')
+        le_color = foreground_at(dog_line, '█▄▄▄█')
+        assert an_color is not None and an_color != le_color, 'An and Le did not use different foreground colors'
+        # A narrow pane keeps the empty state and caption visible.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 64, 0, 0))
         os.kill(client_pid, signal.SIGWINCH)
-        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and dogs_visible() and 'No messages for you yet.' in native_screen(), 'narrow inbox did not show the dogs and caption')
+        until(lambda: int(tmux('display-message', '-p', '-t', native_pane(), '#{pane_width}')) <= 31 and dogs_visible() and 'No messages for you yet.' in native_screen() and '▜' in native_screen(), 'narrow inbox did not show the dogs and caption')
         if os.environ.get('SEREIN_SIDEBAR_DUMP'):
             print(native_screen(), flush=True)
         assert db.execute('SELECT COUNT(*) FROM messages').fetchone()[0] == 0

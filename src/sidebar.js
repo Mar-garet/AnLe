@@ -7,7 +7,7 @@ const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
 export const COMPACT_CONTENT_TOP = 6;
 export const COMPACT_PICKER_TOP = COMPACT_CONTENT_TOP + 2;
 export function compactContentRows(height) {
-  return Math.max(1, Math.max(10, height) - 11);
+  return Math.max(1, Math.max(10, height) - 9);
 }
 
 export function directoryLines(cwd, width) {

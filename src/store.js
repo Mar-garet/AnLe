@@ -46,6 +46,20 @@ export class Store {
         PRIMARY KEY (space_id, thread_id),
         FOREIGN KEY (space_id, thread_id) REFERENCES members(space_id, thread_id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS reviewer_pairs (
+        space_id TEXT NOT NULL,
+        developer_id TEXT NOT NULL,
+        reviewer_id TEXT,
+        status TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        intro_state TEXT NOT NULL DEFAULT 'pending',
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (space_id, developer_id),
+        UNIQUE (space_id, reviewer_id),
+        FOREIGN KEY (space_id, developer_id) REFERENCES members(space_id, thread_id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
         space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
@@ -90,6 +104,67 @@ export class Store {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS console_navigation_console ON console_navigation(console_id);
+      CREATE TABLE IF NOT EXISTS reviews (
+        id TEXT PRIMARY KEY,
+        space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        developer_id TEXT NOT NULL,
+        reviewer_id TEXT,
+        goal TEXT NOT NULL,
+        repo_root TEXT NOT NULL,
+        base_oid TEXT,
+        paths_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_round INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS reviews_developer ON reviews(space_id, developer_id, created_at);
+      CREATE TABLE IF NOT EXISTS review_settings (
+        space_id TEXT PRIMARY KEY REFERENCES spaces(id) ON DELETE CASCADE,
+        instructions TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS review_rounds (
+        review_id TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+        round INTEGER NOT NULL,
+        snapshot_path TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        head_oid TEXT NOT NULL,
+        changed_paths_json TEXT NOT NULL,
+        untracked_json TEXT NOT NULL,
+        request_message_id TEXT,
+        turn_id TEXT,
+        status TEXT NOT NULL,
+        result_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(review_id, round)
+      );
+      CREATE TABLE IF NOT EXISTS review_findings (
+        review_id TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+        id TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        title TEXT NOT NULL,
+        path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        created_round INTEGER NOT NULL,
+        updated_round INTEGER NOT NULL,
+        PRIMARY KEY(review_id, id)
+      );
+      CREATE TABLE IF NOT EXISTS review_notifications (
+        review_id TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        recipient_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        message_id TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(review_id, round, recipient_id),
+        FOREIGN KEY(review_id, round) REFERENCES review_rounds(review_id, round) ON DELETE CASCADE
+      );
     `);
     // Upgrade older databases atomically, retaining their messages and roles.
     this.db.exec('BEGIN IMMEDIATE');
@@ -227,7 +302,88 @@ export class Store {
   updateMember(spaceId, threadId, {name, role}) {
     name = requiredText(name, 'Node name', 80);
     if (name.toLowerCase() === HUMAN) throw new Error('The name "human" is reserved');
-    this.db.prepare('UPDATE members SET name = ?, role = ? WHERE space_id = ? AND thread_id = ?').run(name, String(role || '').trim().slice(0, 500), spaceId, threadId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE members SET name = ?, role = ? WHERE space_id = ? AND thread_id = ?').run(name, String(role || '').trim().slice(0, 500), spaceId, threadId);
+      const pair = this.reviewerPair(spaceId, threadId);
+      if (pair?.reviewer_id && this.member(spaceId, pair.reviewer_id)) {
+        this.db.prepare('UPDATE members SET name = ? WHERE space_id = ? AND thread_id = ?')
+          .run(this.availableReviewerName(spaceId, name, pair.reviewer_id), spaceId, pair.reviewer_id);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  reviewerPairs(spaceId) { return this.db.prepare('SELECT * FROM reviewer_pairs WHERE space_id = ? ORDER BY rowid').all(spaceId); }
+  reviewerPair(spaceId, developerId) { return this.db.prepare('SELECT * FROM reviewer_pairs WHERE space_id = ? AND developer_id = ?').get(spaceId, developerId); }
+  pairForReviewer(spaceId, reviewerId) { return this.db.prepare('SELECT * FROM reviewer_pairs WHERE space_id = ? AND reviewer_id = ?').get(spaceId, reviewerId); }
+  reviewerThreadIds() { return this.db.prepare('SELECT reviewer_id FROM reviewer_pairs WHERE reviewer_id IS NOT NULL UNION SELECT reviewer_id FROM reviews WHERE reviewer_id IS NOT NULL').all().map(item => item.reviewer_id); }
+  isReviewerThread(threadId) {
+    return !!this.db.prepare('SELECT 1 FROM reviewer_pairs WHERE reviewer_id = ? UNION ALL SELECT 1 FROM reviews WHERE reviewer_id = ? LIMIT 1').get(threadId, threadId);
+  }
+
+  availableReviewerName(spaceId, developerName, exceptId = '') {
+    for (let n = 1; n < 10000; n++) {
+      const suffix = n === 1 ? ' CR' : ` CR ${n}`;
+      const name = `${developerName.slice(0, 80 - suffix.length)}${suffix}`;
+      const existing = this.member(spaceId, name);
+      if (!existing || existing.thread_id === exceptId) return name;
+    }
+    throw new Error('Could not choose a unique CR name');
+  }
+
+  claimReviewerPair(spaceId, developerId, retry = false) {
+    const developer = this.member(spaceId, developerId);
+    if (!developer || this.isReviewerThread(developer.thread_id)) throw new Error('A coding session is required for a CR pair');
+    const attempt = randomUUID();
+    const timestamp = now();
+    this.db.prepare(`INSERT OR IGNORE INTO reviewer_pairs (space_id, developer_id, status, attempt_id, created_at, updated_at)
+      VALUES (?, ?, 'creating', ?, ?, ?)`).run(spaceId, developer.thread_id, attempt, timestamp, timestamp);
+    if (retry) this.db.prepare(`UPDATE reviewer_pairs SET status = 'creating', attempt_id = ?, intro_state = 'pending', error = NULL, updated_at = ?
+      WHERE space_id = ? AND developer_id = ? AND status IN ('failed', 'disabled')`).run(attempt, timestamp, spaceId, developer.thread_id);
+    const pair = this.reviewerPair(spaceId, developer.thread_id);
+    return {pair, claimed: pair.attempt_id === attempt && pair.status === 'creating'};
+  }
+
+  finishReviewerPair(spaceId, developerId, attemptId, reviewerId, cwd, role) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const pair = this.reviewerPair(spaceId, developerId);
+      const developer = this.member(spaceId, developerId);
+      if (!pair || pair.status !== 'creating' || pair.attempt_id !== attemptId || !developer) throw new Error('The CR pairing request is no longer active');
+      const name = this.availableReviewerName(spaceId, developer.name);
+      this.db.prepare('INSERT INTO members (space_id, thread_id, name, role, cwd, added_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(spaceId, reviewerId, name, role.slice(0, 500), cwd.slice(0, 4000), now());
+      this.db.prepare("UPDATE reviewer_pairs SET reviewer_id = ?, status = 'ready', error = NULL, updated_at = ? WHERE space_id = ? AND developer_id = ?")
+        .run(reviewerId, now(), spaceId, developerId);
+      this.db.exec('COMMIT');
+      return {pair: this.reviewerPair(spaceId, developerId), reviewer: this.member(spaceId, reviewerId)};
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  failReviewerPair(spaceId, developerId, attemptId, status, error) {
+    if (!['failed', 'unknown'].includes(status)) throw new Error('Invalid CR pairing status');
+    this.db.prepare("UPDATE reviewer_pairs SET status = ?, error = ?, updated_at = ? WHERE space_id = ? AND developer_id = ? AND status = 'creating' AND attempt_id = ?")
+      .run(status, String(error).slice(0, 2000), now(), spaceId, developerId, attemptId);
+  }
+
+  claimPairIntroduction(spaceId, developerId) {
+    return this.db.prepare("UPDATE reviewer_pairs SET intro_state = 'sending', updated_at = ? WHERE space_id = ? AND developer_id = ? AND status = 'ready' AND intro_state = 'pending'")
+      .run(now(), spaceId, developerId).changes > 0;
+  }
+
+  finishPairIntroduction(spaceId, developerId, state, error = null) {
+    if (!['queued', 'failed', 'unknown'].includes(state)) throw new Error('Invalid CR introduction state');
+    this.db.prepare("UPDATE reviewer_pairs SET intro_state = ?, error = ?, updated_at = ? WHERE space_id = ? AND developer_id = ? AND intro_state = 'sending'")
+      .run(state, error ? String(error).slice(0, 2000) : null, now(), spaceId, developerId);
+  }
+
+  recoverReviewerPairs() {
+    const cutoff = new Date(Date.now() - 120000).toISOString();
+    this.db.prepare("UPDATE reviewer_pairs SET status = 'unknown', error = 'CR creation was interrupted; inspect existing sessions before retrying.', updated_at = ? WHERE status = 'creating' AND updated_at < ?")
+      .run(now(), cutoff);
+    this.db.prepare("UPDATE reviewer_pairs SET intro_state = 'unknown', error = 'Introduction delivery is uncertain; inspect the coding session before resending.', updated_at = ? WHERE intro_state = 'sending' AND updated_at < ?")
+      .run(now(), cutoff);
   }
 
   updatePresence(spaceId, threadId, {task, status}) {
@@ -265,7 +421,216 @@ export class Store {
   }
 
   removeMember(spaceId, threadId) {
-    this.db.prepare('DELETE FROM members WHERE space_id = ? AND thread_id = ?').run(spaceId, threadId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const ownPair = this.reviewerPair(spaceId, threadId);
+      const paired = this.pairForReviewer(spaceId, threadId);
+      this.db.prepare(`UPDATE reviews SET status = 'closed', error = 'A review participant was removed from the workspace.', updated_at = ?
+        WHERE space_id = ? AND (developer_id = ? OR reviewer_id = ? OR reviewer_id = ?) AND status != 'closed'`).run(now(), spaceId, threadId, threadId, ownPair?.reviewer_id || '');
+      if (paired) this.db.prepare("UPDATE reviewer_pairs SET reviewer_id = NULL, status = 'disabled', intro_state = 'disabled', updated_at = ? WHERE space_id = ? AND developer_id = ?")
+        .run(now(), spaceId, paired.developer_id);
+      if (ownPair?.reviewer_id) this.db.prepare('DELETE FROM members WHERE space_id = ? AND thread_id = ?').run(spaceId, ownPair.reviewer_id);
+      this.db.prepare('DELETE FROM members WHERE space_id = ? AND thread_id = ?').run(spaceId, threadId);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  createReview({spaceId, developerId, goal, repoRoot, paths = []}) {
+    const developer = this.member(spaceId, developerId);
+    if (!developer) throw new Error('The development session is not in this workspace');
+    goal = requiredText(goal, 'Review goal', 4000);
+    repoRoot = requiredText(repoRoot, 'Repository directory', 4000);
+    const id = randomUUID();
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO reviews (id, space_id, developer_id, goal, repo_root, paths_json, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?)`)
+      .run(id, spaceId, developer.thread_id, goal, repoRoot, JSON.stringify(paths), timestamp, timestamp);
+    return this.review(id);
+  }
+
+  reviewSettings(spaceId) {
+    if (!this.space(spaceId)) throw new Error('Workspace not found');
+    return this.db.prepare('SELECT instructions FROM review_settings WHERE space_id = ?').get(spaceId) || {instructions: ''};
+  }
+
+  setReviewSettings(spaceId, instructions) {
+    if (!this.space(spaceId)) throw new Error('Workspace not found');
+    instructions = optionalText(instructions, 3000);
+    this.db.prepare(`INSERT INTO review_settings (space_id, instructions) VALUES (?, ?)
+      ON CONFLICT(space_id) DO UPDATE SET instructions = excluded.instructions`).run(spaceId, instructions);
+    return this.reviewSettings(spaceId);
+  }
+
+  review(id) { return this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(id); }
+
+  reviews(spaceId, threadId = null) {
+    if (threadId) return this.db.prepare('SELECT * FROM reviews WHERE space_id = ? AND (developer_id = ? OR reviewer_id = ?) ORDER BY rowid DESC').all(spaceId, threadId, threadId);
+    return this.db.prepare('SELECT * FROM reviews WHERE space_id = ? ORDER BY rowid DESC').all(spaceId);
+  }
+
+  reviewRounds(id) { return this.db.prepare('SELECT * FROM review_rounds WHERE review_id = ? ORDER BY round').all(id); }
+  reviewFindings(id) { return this.db.prepare('SELECT * FROM review_findings WHERE review_id = ? ORDER BY created_round, rowid').all(id); }
+  reviewNotifications(id, round) { return this.db.prepare('SELECT * FROM review_notifications WHERE review_id = ? AND round = ?').all(id, round); }
+  pendingReviewNotifications() { return this.db.prepare("SELECT DISTINCT review_id, round FROM review_notifications WHERE state = 'pending' ORDER BY updated_at").all(); }
+
+  claimReviewNotification(id, round, recipientId) {
+    return this.db.prepare(`UPDATE review_notifications SET state = 'sending', updated_at = ?
+      WHERE review_id = ? AND round = ? AND recipient_id = ? AND state = 'pending'`).run(now(), id, round, recipientId).changes > 0;
+  }
+
+  finishReviewNotification(id, round, recipientId, {state, messageId = null, error = null}) {
+    if (!['queued', 'delivered', 'failed', 'unknown'].includes(state)) throw new Error('Invalid review notification state');
+    this.db.prepare(`UPDATE review_notifications SET state = ?, message_id = ?, error = ?, updated_at = ?
+      WHERE review_id = ? AND round = ? AND recipient_id = ? AND state = 'sending'`)
+      .run(state, messageId, error ? String(error).slice(0, 2000) : null, now(), id, round, recipientId);
+  }
+
+  recoverReviewNotifications() {
+    const cutoff = new Date(Date.now() - 120000).toISOString();
+    return this.db.prepare(`UPDATE review_notifications SET state = 'unknown', error = ?, updated_at = ?
+      WHERE state = 'sending' AND updated_at < ?`)
+      .run('Delivery did not complete; check Activity before resending.', now(), cutoff).changes;
+  }
+
+  recoverAbandonedReviews() {
+    // The process may have exited while a snapshot or turn was being started.
+    // Never retry automatically: the request might have reached Codex.
+    const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const timestamp = now();
+    const error = 'Review start did not finish; inspect the reviewer session before starting another review.';
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const stale = this.db.prepare("SELECT id, current_round, status FROM reviews WHERE status IN ('preparing', 'starting') AND updated_at < ?").all(cutoff);
+      for (const review of stale) {
+        this.db.prepare("UPDATE reviews SET status = 'unknown', error = ?, updated_at = ? WHERE id = ?").run(error, timestamp, review.id);
+        if (review.status === 'starting') {
+          const round = this.db.prepare('SELECT request_message_id FROM review_rounds WHERE review_id = ? AND round = ?').get(review.id, review.current_round);
+          this.db.prepare("UPDATE review_rounds SET status = 'unknown', updated_at = ? WHERE review_id = ? AND round = ? AND status IN ('starting', 'running')")
+            .run(timestamp, review.id, review.current_round);
+          if (round?.request_message_id) this.db.prepare("UPDATE messages SET state = 'unknown', error = ?, updated_at = ? WHERE id = ? AND state = 'pending'")
+            .run(error, timestamp, round.request_message_id);
+        }
+      }
+      this.db.exec('COMMIT');
+      return stale.length;
+    } catch (failure) { this.db.exec('ROLLBACK'); throw failure; }
+  }
+
+  setReviewReviewer(id, reviewerId) {
+    const review = this.review(id);
+    if (!review || !this.member(review.space_id, reviewerId)) throw new Error('The reviewer is not in this workspace');
+    this.db.prepare('UPDATE reviews SET reviewer_id = ?, updated_at = ? WHERE id = ?').run(reviewerId, now(), id);
+  }
+
+  beginReviewRound(id, developerId) {
+    const result = this.db.prepare(`UPDATE reviews SET status = 'preparing', error = NULL, updated_at = ?
+      WHERE id = ? AND developer_id = ? AND status IN ('waiting', 'failed') AND reviewer_id IS NOT NULL`).run(now(), id, developerId);
+    if (!result.changes) throw new Error('This review is not ready for another round');
+    return this.review(id);
+  }
+
+  saveReviewRound(id, snapshot, requestMessageId) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const review = this.review(id);
+      if (!review || review.status !== 'preparing' || !review.reviewer_id) throw new Error('Review is not ready to start');
+      const round = review.current_round + 1;
+      const timestamp = now();
+      this.db.prepare(`INSERT INTO review_rounds (review_id, round, snapshot_path, fingerprint, head_oid, changed_paths_json, untracked_json, request_message_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?)`)
+        .run(id, round, snapshot.snapshotPath, snapshot.fingerprint, snapshot.headOid, JSON.stringify(snapshot.changedPaths), JSON.stringify(snapshot.untracked), requestMessageId, timestamp, timestamp);
+      this.db.prepare(`UPDATE reviews SET base_oid = COALESCE(base_oid, ?), repo_root = ?, current_round = ?, status = 'starting', error = NULL, updated_at = ? WHERE id = ?`)
+        .run(snapshot.baseOid, snapshot.root, round, timestamp, id);
+      this.db.exec('COMMIT');
+      return this.review(id);
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  markReviewTurn(id, round, turnId) {
+    const timestamp = now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare("UPDATE review_rounds SET turn_id = ?, status = CASE WHEN status IN ('starting', 'unknown') THEN 'running' ELSE status END, updated_at = ? WHERE review_id = ? AND round = ?")
+        .run(turnId, timestamp, id, round);
+      this.db.prepare("UPDATE reviews SET status = 'running', error = NULL, updated_at = ? WHERE id = ? AND current_round = ? AND status IN ('starting', 'unknown')")
+        .run(timestamp, id, round);
+      this.db.exec('COMMIT');
+    } catch (failure) { this.db.exec('ROLLBACK'); throw failure; }
+  }
+
+  failReview(id, status, error) {
+    if (!['failed', 'unknown'].includes(status)) throw new Error('Invalid review failure status');
+    const timestamp = now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(`UPDATE reviews SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN ('preparing', 'starting', 'running')`)
+        .run(status, optionalText(error || '', 2000), timestamp, id);
+      if (result.changes) this.db.prepare(`UPDATE review_rounds SET status = ?, updated_at = ? WHERE review_id = ? AND round = (SELECT current_round FROM reviews WHERE id = ?) AND status IN ('starting', 'running')`)
+        .run(status, timestamp, id, id);
+      this.db.exec('COMMIT');
+      return result.changes > 0;
+    } catch (failure) { this.db.exec('ROLLBACK'); throw failure; }
+  }
+
+  submitReview({id, reviewerId, round, summary, findings, checked = [], unverified = [], freshness}) {
+    summary = requiredText(summary, 'Review summary', 4000);
+    if (!Array.isArray(findings) || findings.length > 80) throw new Error('Provide at most 80 findings');
+    if (!Array.isArray(checked) || !Array.isArray(unverified) || checked.length > 30 || unverified.length > 30) throw new Error('Invalid review verification list');
+    checked = checked.map(value => requiredText(value, 'Verification', 500));
+    unverified = unverified.map(value => requiredText(value, 'Unverified item', 500));
+    if (!['current', 'stale', 'unknown'].includes(freshness)) throw new Error('Invalid snapshot freshness');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const review = this.review(id);
+      if (!review || review.reviewer_id !== reviewerId || !this.member(review.space_id, reviewerId)) throw new Error('Only the assigned reviewer can submit this review');
+      const currentRound = this.db.prepare('SELECT status, request_message_id FROM review_rounds WHERE review_id = ? AND round = ?').get(id, round);
+      if (review.current_round !== round || !currentRound || !['starting', 'running', 'unknown'].includes(review.status) ||
+          (review.status === 'unknown' && currentRound.status !== 'unknown')) throw new Error('This review round is not accepting results');
+      const previous = this.reviewFindings(id);
+      const byId = new Map(previous.map(item => [item.id, item]));
+      const seen = new Set();
+      let nextId = previous.length + 1;
+      const upsert = this.db.prepare(`INSERT INTO review_findings (review_id, id, severity, title, path, line, detail, status, reason, created_round, updated_round)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(review_id, id) DO UPDATE SET severity = excluded.severity, title = excluded.title, path = excluded.path, line = excluded.line, detail = excluded.detail, status = excluded.status, reason = excluded.reason, updated_round = excluded.updated_round`);
+      for (const finding of findings) {
+        if (!finding || typeof finding !== 'object') throw new Error('Invalid finding');
+        const old = finding.id ? byId.get(finding.id) : null;
+        if (finding.id && !old) throw new Error(`Unknown previous finding: ${finding.id}`);
+        const findingId = old?.id || `F${nextId++}`;
+        if (seen.has(findingId)) throw new Error(`Finding repeated: ${findingId}`);
+        seen.add(findingId);
+        const status = finding.status || 'open';
+        if (!['open', 'resolved', 'dismissed'].includes(status) || (!old && status !== 'open')) throw new Error('New findings must be open; previous findings may be open, resolved, or dismissed');
+        const severity = finding.severity || old?.severity;
+        if (!['P0', 'P1', 'P2', 'P3'].includes(severity)) throw new Error('Finding severity must be P0, P1, P2, or P3');
+        const title = requiredText(finding.title || old?.title, 'Finding title', 300);
+        const path = requiredText(finding.path || old?.path, 'Finding path', 2000);
+        if (path.startsWith('/') || path.split('/').includes('..')) throw new Error('Finding paths must be relative to the repository');
+        const line = finding.line ?? old?.line;
+        if (!Number.isInteger(line) || line < 1) throw new Error('Finding line must be a positive integer');
+        const detail = requiredText(finding.detail || old?.detail, 'Finding detail', 3000);
+        const reason = optionalText(finding.reason || '', 2000);
+        if (status !== 'open' && !reason) throw new Error(`Explain why ${findingId} is ${status}`);
+        upsert.run(id, findingId, severity, title, path, line, detail, status, reason, old?.created_round || round, round);
+      }
+      const missing = previous.filter(item => item.status === 'open' && !seen.has(item.id));
+      if (missing.length) throw new Error(`Report the status of previous open findings: ${missing.map(item => item.id).join(', ')}`);
+      const result = {summary, checked, unverified, freshness, findings: this.reviewFindings(id)};
+      const timestamp = now();
+      this.db.prepare(`UPDATE review_rounds SET status = 'completed', result_json = ?, updated_at = ? WHERE review_id = ? AND round = ?`)
+        .run(JSON.stringify(result), timestamp, id, round);
+      this.db.prepare(`UPDATE reviews SET status = 'waiting', error = NULL, updated_at = ? WHERE id = ?`)
+        .run(timestamp, id);
+      // A result proves that a previously uncertain start actually reached Codex.
+      if (currentRound.request_message_id) this.db.prepare("UPDATE messages SET state = 'queued', error = NULL, updated_at = ? WHERE id = ? AND state IN ('pending', 'unknown')")
+        .run(timestamp, currentRound.request_message_id);
+      const notify = this.db.prepare(`INSERT INTO review_notifications (review_id, round, recipient_id, state, updated_at) VALUES (?, ?, ?, 'pending', ?)`);
+      notify.run(id, round, review.developer_id, timestamp);
+      notify.run(id, round, HUMAN, timestamp);
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   createMessage({spaceId, sender, recipient, body, replyTo = null, contextMessageId = null, replyExpected = replyTo ? false : null}) {

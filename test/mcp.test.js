@@ -41,6 +41,8 @@ test('MCP uses Codex metadata to identify the sender and can reply to a human', 
   t.after(() => { child.kill(); store.close(); rmSync(dir, {recursive: true, force: true}); });
   const init = await request('initialize', {protocolVersion: '2025-03-26'});
   assert.equal(init.result.serverInfo.name, 'anle');
+  const toolNames = (await request('tools/list', {})).result.tools.map(tool => tool.name);
+  for (const name of ['request_review', 'list_reviews', 'get_review', 'submit_review']) assert.ok(toolNames.includes(name));
   const noIdentity = await request('tools/call', {name: 'list_members', arguments: {space_id: space.id}});
   assert.equal(noIdentity.result.isError, true);
   const found = await request('tools/call', {name: 'list_members', arguments: {space_id: space.id, query: 'backend', limit: 5}, _meta: {threadId: 'thread-real'}});

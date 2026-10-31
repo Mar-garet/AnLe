@@ -19,7 +19,7 @@ test('directories retain their full absolute path across terminal-width wrapping
 });
 
 test('clicking a name or any wrapped path line selects the correct session', () => {
-  const options = {width: 20, height: 21, selection: 0, nodes};
+  const options = {width: 20, height: 19, selection: 0, nodes};
   const visible = sidebarNodeWindow({nodes, selection: 0, innerWidth: 16, rowCapacity: 10});
   const frontendRows = visible.rows.map((row, index) => ({row, y: index + 6})).filter(item => item.row.index === 1);
   assert.ok(frontendRows.length > 2);
@@ -31,7 +31,7 @@ test('clicking a name or any wrapped path line selects the correct session', () 
 });
 
 test('scrolling keeps the selected session and its directory together', () => {
-  const options = {width: 24, height: 16, selection: 3, nodes};
+  const options = {width: 24, height: 14, selection: 3, nodes};
   const visible = sidebarNodeWindow({nodes, selection: 3, innerWidth: 20, rowCapacity: 5});
   assert.equal(visible.rows[0].type, 'path');
   assert.equal(visible.rows[0].part, 0);
@@ -56,5 +56,5 @@ test('paging exposes the end of a path longer than the viewport', () => {
   assert.ok(last.start > first.start);
   assert.ok(last.rows.map(row => row.text || '').join('').endsWith('last-segment'));
   assert.equal(last.rows.at(-1).type, 'name');
-  assert.equal(compactNodeAt({x: 5, y: 6, width: 20, height: 16, nodes: entries, selection: 1, scrollShift: 100}), 1);
+  assert.equal(compactNodeAt({x: 5, y: 6, width: 20, height: 14, nodes: entries, selection: 1, scrollShift: 100}), 1);
 });

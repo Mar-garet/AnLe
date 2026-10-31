@@ -2,13 +2,16 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Box, Text, render, useApp, useInput, usePaste, useStdin, useStdout} from 'ink';
 import {basename} from 'node:path';
 import stringWidth from 'string-width';
-import {ANLE_WORDMARK, ANLE_WORDMARK_WIDTH, COMPACT_INBOX_PETS, COMPACT_INBOX_PETS_WIDTH, EMPTY_INBOX_PETS, EMPTY_INBOX_PETS_WIDTH, MINI_INBOX_PETS, MINI_INBOX_PETS_WIDTH} from './brand.js';
+import {ANLE_WORDMARK, ANLE_WORDMARK_WIDTH} from './brand.js';
 import {CodexClient} from './codex.js';
 import {groupConversations} from './conversations.js';
 import {draftViewport, editDraft} from './editor.js';
 import {displaySessionItem, readSessionHistory, safeTerminalText} from './history.js';
 import {deliveryLabel, humanNeedsAttention, replyLabel} from './message-status.js';
 import {notifyHumanMessages} from './notifications.js';
+import {PET_COMPACT_WIDTH, PET_FRAME_MS, PET_SCENE_HEIGHT, PET_SCENE_WIDTH, petFrame} from './pet-animation.js';
+import {continueReview, reconcileReviews, startReview} from './review.js';
+import {ensureReviewerPair, queueToReviewer, reviewerInstructions} from './reviewer.js';
 import {HUMAN, Store} from './store.js';
 import {introduce, replyMessage, sendMessage} from './messaging.js';
 import {MouseSequenceParser, positionForScrollbarRow, scrollbarGeometry} from './scroll.js';
@@ -21,18 +24,36 @@ const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
 // remain visible on both light and dark backgrounds, including 256 colors.
 const C = {purple: '#7f4ce5', cyan: '#197f7f', yellow: '#b24c19', an: '#a56a0b', path: '#267f97', pathActive: '#c1561e', foreground: undefined, muted: '#767676', red: '#b24c4c', green: '#197f4c'};
 const T = (value, color = C.foreground, props = {}) => h(Text, {color, ...props}, value);
+// Single-cell corners give the frame a pixel accent without taking content space.
+const PIXEL_BORDER = {topLeft: '▛', top: '─', topRight: '▜', left: '│', right: '│', bottomLeft: '▙', bottom: '─', bottomRight: '▟'};
+const SHARED_HELP_LINES = [
+  ['Ctrl+N', 'Open inbox'],
+  ['Ctrl+V', 'Show activity'],
+  ['Ctrl+O', 'Agent profile'],
+  ['Ctrl+K', 'Snapshot review'],
+  ['Ctrl+Y', 'Review rules'],
+  ['Ctrl+A', 'Add session'],
+  ['Ctrl+X', 'Remove session'],
+  ['Ctrl+E', 'Edit session'],
+  ['Ctrl+L', 'Resend intro'],
+  ['Ctrl+G', 'Switch workspace'],
+  ['Ctrl+W', 'New workspace'],
+  ['Ctrl+D', 'Delete workspace'],
+  ['Ctrl+U', 'Desktop alerts'],
+  ['Ctrl+R', 'Refresh'],
+  ['Ctrl+S', 'Connect MCP'],
+  ['Ctrl+P', 'Show shortcuts'],
+  ['Ctrl+Q', 'Quit'],
+];
+const HELP_LINES = [['↑ / ↓', 'Select'], ['Enter', 'Open'], ['F6', 'Focus sidebar'], ['F7', 'Focus right pane'], ...SHARED_HELP_LINES];
+const CLASSIC_HELP_LINES = [['↑ / ↓', 'Select / scroll'], ['Tab', 'Change focus'], ['Enter', 'Open / send'], ...SHARED_HELP_LINES];
 
-function inboxPetLayout(width, height, composeHeight) {
-  // Leave enough horizontal space for message metadata and a readable reply.
+function inboxPetLayout(width, height, composeHeight, empty) {
   const innerWidth = width - 5;
   const innerHeight = height - 2 - composeHeight;
-  if (height >= 18 && innerWidth >= EMPTY_INBOX_PETS_WIDTH + 31 && innerHeight >= EMPTY_INBOX_PETS.length + 2) {
-    return {kind: 'full', art: EMPTY_INBOX_PETS, sideWidth: EMPTY_INBOX_PETS_WIDTH + 1};
-  }
-  if (innerWidth >= COMPACT_INBOX_PETS_WIDTH + 31 && innerHeight >= COMPACT_INBOX_PETS.length + 2) {
-    return {kind: 'compact', art: COMPACT_INBOX_PETS, sideWidth: COMPACT_INBOX_PETS_WIDTH + 1};
-  }
-  return {kind: 'mini', art: MINI_INBOX_PETS, sideWidth: 0};
+  if (empty && innerWidth >= PET_SCENE_WIDTH + 2 && innerHeight >= PET_SCENE_HEIGHT + 4) return {kind: 'inline', sideWidth: 0};
+  if (!empty && innerWidth >= PET_SCENE_WIDTH + 32 && innerHeight >= PET_SCENE_HEIGHT + 1) return {kind: 'side', sideWidth: PET_SCENE_WIDTH + 1};
+  return {kind: 'mini', sideWidth: 0};
 }
 
 export async function startConsole({nativeManager = null, inboxOnly = false, activityOnly = false, initialSpaceId = null} = {}) {
@@ -55,6 +76,8 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [spaces, setSpaces] = useState(() => store.spaces());
   const [spaceId, setSpaceId] = useState(() => initialSpaceId || store.spaces()[0].id);
   const [members, setMembers] = useState([]);
+  const [reviews, setReviews] = useState([]);
+  const [reviewerPairs, setReviewerPairs] = useState([]);
   const [messages, setMessages] = useState([]);
   const [humanMessages, setHumanMessages] = useState([]);
   const [inboxPendingOnly, setInboxPendingOnly] = useState(false);
@@ -75,6 +98,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [conversationId, setConversationId] = useState(null);
   const [messageSelection, setMessageSelection] = useState(0);
   const [profileOffset, setProfileOffset] = useState(0);
+  const [helpOffset, setHelpOffset] = useState(0);
   const [detailOffset, setDetailOffset] = useState(0);
   const [detailMessageId, setDetailMessageId] = useState(null);
   const [sessionOffset, setSessionOffset] = useState(0);
@@ -87,10 +111,18 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const [mode, setMode] = useState('normal');
   const [input, setInput] = useState('');
   const [draft, setDraft] = useState(null);
-  const [notice, setNotice] = useState(inboxOnly ? 'Select a message and type your reply · Enter sends' : activityOnly ? 'Select a message · Enter opens details' : 'Select a session and type below · Ctrl+N opens your inbox');
+  const [notice, setNotice] = useState(inboxOnly ? 'Select a message and type your reply · Enter sends' : activityOnly ? 'Select a message · Enter opens details' : nativeManager ? 'F6/F7 focus · CR auto-paired' : 'Select a session and type below · Ctrl+N opens your inbox');
 
   const space = spaces.find(item => item.id === spaceId) || spaces[0];
-  const selected = selection === 0 ? {thread_id: HUMAN, name: 'human', role: 'Your node'} : members[selection - 1];
+  const selectedMember = selection === 0 ? {thread_id: HUMAN, name: 'human', role: 'Your node'} : members[selection - 1];
+  const selectedReview = reviews.find(item => item.reviewer_id === selectedMember?.thread_id && item.status !== 'closed');
+  const selectedPair = reviewerPairs.find(item => item.reviewer_id === selectedMember?.thread_id && item.status === 'ready');
+  const ownedPair = reviewerPairs.find(item => item.developer_id === selectedMember?.thread_id);
+  const reviewerDirectory = selectedReview?.snapshot_path || (selectedPair ? selectedMember?.cwd : null);
+  const selected = selectedMember ? {...selectedMember,
+    ...(reviewerDirectory ? {review_snapshot_path: reviewerDirectory} : {}),
+    ...(ownedPair ? {review_pair: {...ownedPair, reviewer_name: members.find(item => item.thread_id === ownedPair.reviewer_id)?.name}} : {}),
+    ...(selectedPair ? {review_owner_name: members.find(item => item.thread_id === selectedPair.developer_id)?.name} : {})} : selectedMember;
   const inbox = useMemo(() => inboxPendingOnly ? humanMessages.filter(humanNeedsAttention) : humanMessages, [humanMessages, inboxPendingOnly]);
   const unreadCount = humanMessages.filter(message => !message.human_read_at).length;
   const attentionCount = humanMessages.filter(humanNeedsAttention).length;
@@ -117,7 +149,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const sidebarWidth = Math.max(25, Math.min(34, Math.floor(size.columns * 0.32)));
   const feedWidth = inboxOnly || activityOnly ? size.columns : Math.max(30, size.columns - sidebarWidth - 2);
   const petLayout = !nativeManager && view === 'node' && selected?.thread_id === HUMAN && (mode === 'normal' || mode === 'detail') ?
-    inboxPetLayout(feedWidth, panelHeight, composeHeight) : null;
+    inboxPetLayout(feedWidth, panelHeight, composeHeight, mode === 'normal' && contentMessages.length === 0) : null;
   const waitingMessages = useMemo(() => {
     if (!sessionThreadId) return [];
     const seen = new Set();
@@ -174,6 +206,10 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     }
     setSpaces(store.spaces());
     setMembers(store.members(spaceId));
+    if (!inboxOnly && !activityOnly) {
+      setReviews(store.reviews(spaceId).map(review => ({...review, snapshot_path: store.reviewRounds(review.id).at(-1)?.snapshot_path || null})));
+      setReviewerPairs(store.reviewerPairs(spaceId));
+    }
     setMessages(store.messages(spaceId, null));
     setHumanMessages(store.humanInbox());
     setDesktopNotifications(store.desktopNotificationsEnabled());
@@ -311,7 +347,62 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       if (!cancelled) setNotice(`Could not open Codex: ${error.message || String(error)}`);
     });
     return () => { cancelled = true; };
-  }, [nativeManager, client, selected?.thread_id, selected?.cwd, space.id, view]);
+  }, [nativeManager, client, selected?.thread_id, selected?.cwd, selected?.review_snapshot_path, space.id, view]);
+
+  useEffect(() => {
+    if (!client || inboxOnly || activityOnly) return;
+    let busy = false;
+    const poll = async () => {
+      if (busy) return;
+      busy = true;
+      try { await reconcileReviews(store, client); } catch {}
+      finally { busy = false; }
+    };
+    void poll();
+    const timer = setInterval(poll, 5000);
+    return () => clearInterval(timer);
+  }, [client, store, inboxOnly, activityOnly]);
+
+  useEffect(() => {
+    if (!client || integration !== 'ready' || inboxOnly || activityOnly) return;
+    let busy = false;
+    let cancelled = false;
+    const poll = async () => {
+      if (busy || cancelled) return;
+      busy = true;
+      try {
+        store.recoverReviewerPairs();
+        const loaded = new Set((await client.request('thread/loaded/list')).data || []);
+        let created = 0;
+        for (const currentSpace of store.spaces()) {
+          for (const coding of store.members(currentSpace.id)) {
+            if (cancelled) return;
+            let pair = store.reviewerPair(currentSpace.id, coding.thread_id);
+            if (!pair && !store.isReviewerThread(coding.thread_id) && created < 3) {
+              created++;
+              try { pair = (await ensureReviewerPair({store, spaceId: currentSpace.id, developerId: coding.thread_id, client})).pair; }
+              catch (error) { if (!cancelled) setNotice(`Could not create ${coding.name} CR: ${error.message || error}`); }
+            }
+            if (pair?.status !== 'ready' || pair.intro_state !== 'pending' || !loaded.has(coding.thread_id)) continue;
+            if (!store.claimPairIntroduction(currentSpace.id, coding.thread_id)) continue;
+            try {
+              const reviewer = store.member(currentSpace.id, pair.reviewer_id);
+              if (!reviewer) throw new Error('The dedicated CR is missing');
+              await introduce(currentSpace, coding, undefined, {reviewer});
+              store.finishPairIntroduction(currentSpace.id, coding.thread_id, 'queued');
+            } catch (error) {
+              const unknown = error.killed || error.signal || ['ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.code) || /timed? out|disconnect/i.test(error.message || '');
+              store.finishPairIntroduction(currentSpace.id, coding.thread_id, unknown ? 'unknown' : 'failed', error.message || error);
+              if (!cancelled) setNotice(`Could not introduce ${coding.name} to its CR: ${error.message || error}`);
+            }
+          }
+        }
+      } catch {} finally { busy = false; }
+    };
+    void poll();
+    const timer = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [client, integration, store, inboxOnly, activityOnly]);
 
   useEffect(() => {
     if (!nativeManager) return;
@@ -346,6 +437,34 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   function prompt(nextMode, value = '') { setInput(value); setMode(nextMode); }
   function finish() { setMode('normal'); setInput(''); setDraft(null); refreshStore(); }
   function run(task) { Promise.resolve().then(task).catch(error => setNotice(error.message || String(error))).finally(refreshStore); }
+  async function introduceMember(currentSpace, currentMember, {force = false} = {}) {
+    const owner = store.pairForReviewer(currentSpace.id, currentMember.thread_id);
+    if (owner) {
+      const developer = store.member(currentSpace.id, owner.developer_id);
+      if (!developer) throw new Error('The paired coding session is missing');
+      await queueToReviewer(store, currentSpace.id, currentMember.thread_id,
+        reviewerInstructions(currentSpace, developer, store.reviewSettings(currentSpace.id).instructions));
+      return;
+    }
+    const assigned = await ensureReviewerPair({store, spaceId: currentSpace.id, developerId: currentMember.thread_id, client, retry: force});
+    if (!assigned.reviewer || assigned.pair.status !== 'ready') throw new Error(`Dedicated CR is ${assigned.pair.status}; inspect the workspace before retrying`);
+    const claimed = store.claimPairIntroduction(currentSpace.id, currentMember.thread_id);
+    if (!claimed) {
+      const state = store.reviewerPair(currentSpace.id, currentMember.thread_id)?.intro_state;
+      if (state === 'sending' || (!force && state === 'queued')) return;
+      if (!force) throw new Error(`CR introduction is ${state}; inspect the coding session before resending`);
+    }
+    try {
+      await introduce(currentSpace, currentMember, undefined, {reviewer: assigned.reviewer});
+      if (claimed) store.finishPairIntroduction(currentSpace.id, currentMember.thread_id, 'queued');
+    } catch (error) {
+      if (claimed) {
+        const unknown = error.killed || error.signal || ['ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.code) || /timed? out|disconnect/i.test(error.message || '');
+        store.finishPairIntroduction(currentSpace.id, currentMember.thread_id, unknown ? 'unknown' : 'failed', error.message || error);
+      }
+      throw error;
+    }
+  }
   function updateInlineDraft(action, value = '') {
     if (!composeKey) return;
     setInlineDrafts(current => ({...current, [composeKey]: editDraft(current[composeKey], action, value)}));
@@ -414,6 +533,15 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     setProfileOffset(value => Math.max(0, Math.min(limit, value + amount)));
   }
 
+  function helpCapacity() {
+    return nativeManager ? Math.max(1, compactContentRows(size.rows) - 2) : Math.max(1, panelHeight - 4);
+  }
+
+  function scrollHelp(amount) {
+    const limit = Math.max(0, (nativeManager ? HELP_LINES : CLASSIC_HELP_LINES).length - helpCapacity());
+    setHelpOffset(value => Math.max(0, Math.min(limit, value + amount)));
+  }
+
   function toggleHumanDone() {
     const message = mode === 'detail' ? detailMessage : contentMessages[messageSelection];
     if (!message || message.recipient_id !== HUMAN) return;
@@ -467,8 +595,8 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         setDraft({...draft, name: value}); prompt('join-role');
       } else if (mode === 'join-role') {
         const member = store.addMember(space.id, {threadId: draft.thread.id, name: draft.name, role: value, cwd: draft.thread.cwd || ''});
-        finish(); setSelection(members.length + 1); setNotice(`Sending an introduction to ${member.name}…`);
-        run(async () => { await introduce(space, member); setNotice(`${member.name} joined. Introduction queued in the original session.`); });
+        finish(); setSelection(members.length + 1); setNotice(`Creating ${member.name} CR…`);
+        run(async () => { await introduceMember(space, member); await refreshThreads(); setNotice(`${member.name} and its CR joined. Introduction queued.`); });
       } else if (mode === 'edit-name') {
         if (!value) throw new Error('Node name cannot be empty');
         setDraft({...draft, name: value}); prompt('edit-role', draft.member.role);
@@ -476,13 +604,35 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         store.updateMember(space.id, draft.member.thread_id, {name: draft.name, role: value});
         const updated = store.member(space.id, draft.member.thread_id);
         finish(); setNotice('Node updated. Sending an introduction…');
-        run(async () => { await introduce(space, updated); setNotice(`Introduction queued in ${updated.name}'s original session.`); });
+        run(async () => {
+          const pair = store.reviewerPair(space.id, updated.thread_id);
+          const reviewer = pair?.reviewer_id && store.member(space.id, pair.reviewer_id);
+          if (reviewer) await client?.request('thread/name/set', {threadId: reviewer.thread_id, name: reviewer.name}).catch(() => {});
+          await introduceMember(space, updated, {force: true});
+          setNotice(`Introduction queued in ${updated.name}'s original session.`);
+        });
+      } else if (mode === 'review-goal') {
+        if (!value) throw new Error('Review goal cannot be empty');
+        setDraft({...draft, goal: value}); prompt('review-base');
+      } else if (mode === 'review-base') {
+        setDraft({...draft, base: value || undefined}); prompt('review-paths');
+      } else if (mode === 'review-paths') {
+        const request = {...draft, paths: value ? value.split(',').map(path => path.trim()).filter(Boolean) : []};
+        finish(); setNotice('Creating review snapshot…');
+        run(async () => {
+          const result = await startReview({store, spaceId: request.spaceId, developerId: request.member.thread_id, initiatorId: HUMAN, goal: request.goal, base: request.base, paths: request.paths, client});
+          await refreshThreads();
+          setNotice(`Review started: ${result.reviewer.name} · round 1`);
+        });
+      } else if (mode === 'review-rules') {
+        store.setReviewSettings(draft.spaceId, value);
+        finish(); setNotice(value ? 'Review rules saved.' : 'Review rules cleared.');
       }
     } catch (error) { setNotice(error.message || String(error)); }
   }
 
   usePaste(text => {
-    if (['new-space', 'picker-search', 'join-name', 'join-role', 'edit-name', 'edit-role'].includes(mode)) setInput(old => old + text.replaceAll('\n', ' '));
+    if (['new-space', 'picker-search', 'join-name', 'join-role', 'edit-name', 'edit-role', 'review-goal', 'review-base', 'review-paths', 'review-rules'].includes(mode)) setInput(old => old + text.replaceAll('\n', ' '));
     else if (nativeManager && mode === 'normal' && view === 'node' && selected?.thread_id === HUMAN && focus === 'nodes') {
       nativeManager.forwardInbox(space.id, text, true).catch(error => setNotice(error.message || String(error)));
     }
@@ -567,12 +717,31 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       }
       return;
     }
-    if (mode === 'help') { setMode('normal'); return; }
+    if (mode === 'help') {
+      if (key.escape || keyInput === 'q' || (key.ctrl && keyInput === 'p')) setMode('normal');
+      else if (key.upArrow || key.pageUp) scrollHelp(key.pageUp ? -Math.max(1, helpCapacity() - 1) : -1);
+      else if (key.downArrow || key.pageDown) scrollHelp(key.pageDown ? Math.max(1, helpCapacity() - 1) : 1);
+      return;
+    }
+    if (mode === 'review-action') {
+      if (key.escape) { finish(); return; }
+      if (keyInput.toLowerCase() === 'n') { setDraft({member: draft.member, spaceId: draft.spaceId}); prompt('review-goal', draft.member.current_task || ''); return; }
+      if (keyInput.toLowerCase() === 'r' && ['waiting', 'failed'].includes(draft.review.status)) {
+        const request = {...draft};
+        finish(); setNotice('Preparing another review round…');
+        run(async () => {
+          const result = await continueReview({store, spaceId: request.spaceId, reviewId: request.review.id, initiatorId: HUMAN, client});
+          await refreshThreads();
+          setNotice(`Review started: ${result.reviewer.name} · round ${result.review.current_round}`);
+        });
+      }
+      return;
+    }
     if (mode === 'confirm-remove') {
       if (keyInput.toLowerCase() === 'y' && selected && selection > 0) {
         store.removeMember(space.id, selected.thread_id); setNotice(`${selected.name} removed from the workspace.`); setSelection(0); refreshStore();
       }
-      setMode('normal'); return;
+      setMode('normal'); setDraft(null); return;
     }
     if (mode === 'confirm-delete-space') {
       if (key.escape || keyInput.toLowerCase() === 'n') { setMode('normal'); setDraft(null); return; }
@@ -638,7 +807,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       else if (focus === 'input') setFocus('messages');
       return;
     }
-    if ((key.ctrl && keyInput === 'p') || (!nativeManager && !composeTarget && mode === 'normal' && keyInput === '?')) { setMode('help'); return; }
+    if ((key.ctrl && keyInput === 'p') || (!nativeManager && !composeTarget && mode === 'normal' && keyInput === '?')) { setHelpOffset(0); setMode('help'); return; }
     if (command('a')) {
       if (integration !== 'ready') { setNotice('Press Ctrl+S to connect AnLe MCP before adding sessions.'); return; }
       if (!client || client.ws?.readyState !== 1) { setNotice('Press Ctrl+R to reconnect to Codex.'); return; }
@@ -664,15 +833,37 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       setSpaceId(spaces[(index + 1) % spaces.length].id); setSelection(0); setView('node'); setFocus('nodes'); setMode('normal');
       return;
     }
+    if (key.ctrl && keyInput.toLowerCase() === 'y' && view === 'node') {
+      setDraft({spaceId: space.id});
+      prompt('review-rules', store.reviewSettings(space.id).instructions);
+      return;
+    }
+    if (key.ctrl && keyInput.toLowerCase() === 'k' && selection > 0 && selected && view === 'node') {
+      if (integration !== 'ready') { setNotice('Press Ctrl+S to connect AnLe MCP before review.'); return; }
+      if (!client || client.ws?.readyState !== 1) { setNotice('Press Ctrl+R to reconnect to Codex.'); return; }
+      const developerId = selectedPair?.developer_id || selected.thread_id;
+      const existing = selectedReview || reviews.find(item => item.developer_id === developerId && item.status !== 'closed' && (item.reviewer_id || item.status === 'unknown'));
+      const developer = store.member(space.id, existing?.developer_id || developerId);
+      if (!developer) { setNotice('The development session is no longer in this workspace.'); return; }
+      setDraft({member: developer, spaceId: space.id, review: existing});
+      if (existing) setMode('review-action');
+      else prompt('review-goal', developer.current_task || '');
+      return;
+    }
     if (command('e') && selection > 0 && selected) { setDraft({member: selected}); prompt('edit-name', selected.name); return; }
     if (key.ctrl && keyInput.toLowerCase() === 'o' && selection > 0 && selected && view === 'node') { setProfileOffset(0); setMode('profile'); return; }
-    if (command('x') && selection > 0) { setMode('confirm-remove'); return; }
+    if (command('x') && selection > 0) {
+      const pair = reviewerPairs.find(item => item.developer_id === selected?.thread_id && item.status === 'ready');
+      const owner = reviewerPairs.find(item => item.reviewer_id === selected?.thread_id);
+      setDraft({removeReviewer: pair ? membersByThread.get(pair.reviewer_id)?.name : null, removeCR: !!owner});
+      setMode('confirm-remove'); return;
+    }
     if (key.ctrl && keyInput === 'd') {
       setDraft({spaceId: space.id, spaceName: space.name, memberCount: store.members(space.id).length, messageCount: store.messages(space.id, null).length, replacement: store.spaces().length === 1});
       setMode('confirm-delete-space');
       return;
     }
-    if (((key.ctrl && keyInput === 'l') || (!nativeManager && !composeTarget && mode === 'normal' && keyInput === 'i')) && selection > 0 && selected) { run(async () => { await introduce(space, selected); setNotice(`Introduction queued in ${selected.name}'s original session.`); }); return; }
+    if (((key.ctrl && keyInput === 'l') || (!nativeManager && !composeTarget && mode === 'normal' && keyInput === 'i')) && selection > 0 && selected) { run(async () => { await introduceMember(space, selected, {force: true}); setNotice(`Introduction queued in ${selected.name}'s original session.`); }); return; }
     if (command('r')) {
       refreshStore();
       if (sessionThreadId) setHistoryRefresh(value => value + 1);
@@ -782,7 +973,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         const grab = row >= geometry.thumbStart && row < geometry.thumbStart + geometry.thumbLength ? row - geometry.thumbStart : Math.floor(geometry.thumbLength / 2);
         mouseDrag.current = {grab};
         scrollTo(positionForScrollbarRow(geometry, row, grab));
-      } else if ((event.button & 3) === 0 && petLayout?.sideWidth && event.x >= size.columns - petLayout.sideWidth - 2 && event.x < size.columns - 2) {
+      } else if ((event.button & 3) === 0 && petLayout?.sideWidth && event.x >= size.columns - 2 - (geometry?.maxPosition ? 1 : 0) - petLayout.sideWidth && event.x < size.columns - 2 - (geometry?.maxPosition ? 1 : 0)) {
         return;
       } else if ((event.button & 3) === 0 && mode === 'normal' && event.y >= 5) {
         const row = Math.floor((event.y - 5) / 2);
@@ -816,6 +1007,10 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
         if (wheel !== null) scrollProfile(direction * 3);
         return;
       }
+      if (mode === 'help') {
+        if (wheel !== null) scrollHelp(direction * 3);
+        return;
+      }
       if (mode !== 'normal') return;
       const showingNodes = view === 'activity' || (view === 'node' && (selection > 0 || focus === 'nodes'));
       if (showingNodes) {
@@ -841,9 +1036,12 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
       }
       return;
     }
-    if (mode === 'profile' && (event.button & 64) && size.columns >= 64 && size.rows >= 18 && event.x > sidebarWidth + 1) {
+    if ((mode === 'profile' || mode === 'help') && (event.button & 64) && size.columns >= 64 && size.rows >= 18 && event.x > sidebarWidth + 1) {
       const direction = event.button & 3;
-      if (direction <= 1) scrollProfile(direction === 0 ? -3 : 3);
+      if (direction <= 1) {
+        if (mode === 'help') scrollHelp(direction === 0 ? -3 : 3);
+        else scrollProfile(direction === 0 ? -3 : 3);
+      }
       return;
     }
     if (mode === 'picker' && size.columns >= 64 && size.rows >= 18) {
@@ -921,11 +1119,11 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
   const statusMap = Object.fromEntries(threads.map(thread => [thread.id, thread.status?.type]));
   if (inboxOnly || activityOnly) {
     return h(Box, {flexDirection: 'column'},
-      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, statusMap, width: feedWidth, height: panelHeight}),
+      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
       T(` ${safeTerminalText(notice).replaceAll('\n', ' ')} · F6 sessions`, C.muted, {wrap: 'truncate-end'}));
   }
   if (nativeManager) {
-    return h(CompactSidebar, {size, selected, members: sidebarMembers, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, desktopNotifications, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
+    return h(CompactSidebar, {size, selected, members: sidebarMembers, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, composeTarget, inlineDraft, sending: !!sendingDrafts[composeKey]});
   }
   if (size.columns < 64 || size.rows < 18) {
     return h(Box, {padding: 1, flexDirection: 'column'}, h(Text, {bold: true}, T('An', C.an), T('Le', C.foreground)), T('Resize the terminal to at least 64 × 18. Press Ctrl+Q to quit.', C.muted));
@@ -935,7 +1133,7 @@ function Console({store, nativeManager, inboxOnly, activityOnly, initialSpaceId}
     h(Header, {connection, spaceCount: spaces.length, unreadCount}),
     h(Box, {flexDirection: 'row'},
       h(Sidebar, {space, members: sidebarMembers, selectedIndex: selection, sidebarScroll, statusMap, unreadCount, attentionCount, width: sidebarWidth, height: panelHeight}),
-      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, statusMap, width: feedWidth, height: panelHeight}),
+      h(MainPanel, {mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending: !!sendingDrafts[composeKey], pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, statusMap, width: feedWidth, height: panelHeight}),
     ),
     h(Box, {paddingX: 1}, T('◆ ', C.yellow), T(notice, C.muted, {wrap: 'truncate-end'})),
     h(Box, {paddingX: 1, overflow: 'hidden'}, T('Tab', C.cyan), T(' focus  ', C.muted), T('^A', C.cyan), T(' add  ', C.muted), T('^N', C.cyan), T(' inbox  ', C.muted), T('^V', C.cyan), T(view === 'activity' ? ' node  ' : ' feed  ', C.muted), T('^P', C.cyan), T(' help  ', C.muted), T('^Q', C.cyan), T(' quit', C.muted)),
@@ -978,10 +1176,17 @@ function profileLines(member, runtime, width) {
   add('ROLE / RESPONSIBILITY', member.role);
   add('CURRENT TASK', member.current_task);
   add('DIRECTORY', member.cwd);
+  if (member.review_pair) add('DEDICATED CR', `${member.review_pair.reviewer_name || 'Unavailable'} · ${member.review_pair.status.toUpperCase()}${member.review_pair.error ? ` · ${member.review_pair.error}` : ''}`);
+  if (member.review_owner_name) add('REVIEWS FOR', member.review_owner_name);
   return rows;
 }
 
-function CompactSidebar({size, selected, members, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, desktopNotifications, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, composeTarget, inlineDraft, sending}) {
+function renderHelpRows(lines) {
+  return lines.map(([shortcut, description]) => h(Text, {key: shortcut, wrap: 'truncate-end'},
+    T(shortcut.padEnd(8), C.purple, {bold: true}), T(description, C.foreground)));
+}
+
+function CompactSidebar({size, selected, members, selection, sidebarScroll, statusMap, connection, unreadCount, attentionCount, mode, view, focus, notice, contentMessages, messageSelection, detailMessage, detailOffset, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, composeTarget, inlineDraft, sending}) {
   const width = Math.max(20, size.columns);
   const height = Math.max(10, size.rows);
   const innerWidth = Math.max(8, width - 4);
@@ -993,27 +1198,36 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
     const rowCapacity = Math.max(1, room - 2);
     const {rows, total} = sidebarNodeWindow({nodes: pickerNodes, selection: pickerSelection, innerWidth, rowCapacity, scrollShift: pickerScroll});
     nodeOverflow = total > rowCapacity;
-    body = [T('SELECT SESSION', C.cyan, {bold: true, key: 'title'}), T('↑↓ · / search · Enter', C.muted, {key: 'hint', wrap: 'truncate-end'}),
+    body = [T('■  SELECT SESSION', C.cyan, {bold: true, key: 'title'}), T('↑↓ · / search · Enter', C.muted, {key: 'hint', wrap: 'truncate-end'}),
       ...renderPickerRows(rows, pickerSelection, {idLength: 4, showStatus: false, innerWidth}),
       pickerNodes.length === 0 ? T(pickerLoading ? 'Loading…' : 'No matching sessions', C.muted, {key: 'empty'}) : null];
   } else if (mode === 'help') {
-    body = [T('SHORTCUTS', C.cyan, {bold: true, key: 'title'}),
-      ...['↑↓ select · Enter open', 'F6 list · F7 Codex', 'Ctrl+O agent profile', 'Ctrl+N inbox · Ctrl+V activity', 'Ctrl+U desktop alerts', 'Ctrl+A add · Ctrl+X remove', 'Ctrl+E edit · Ctrl+L intro', 'Ctrl+G switch · Ctrl+W new', 'Ctrl+D delete workspace', 'Ctrl+R refresh · Ctrl+S connect', 'Ctrl+Q quit · Any key back'].map(line => T(line, C.muted, {key: line, wrap: 'truncate-end'}))];
+    const capacity = Math.max(1, room - 2);
+    const offset = Math.min(helpOffset, Math.max(0, HELP_LINES.length - capacity));
+    body = [T(`■  SHORTCUTS  ${offset + 1}-${Math.min(offset + capacity, HELP_LINES.length)}/${HELP_LINES.length}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
+      ...renderHelpRows(HELP_LINES.slice(offset, offset + capacity)),
+      T('↑↓ scroll · Esc back', C.muted, {key: 'hint', wrap: 'truncate-end'})];
   } else if (mode === 'profile') {
     const rows = profileLines(selected, connection === 'CONNECTED' ? statusMap[selected?.thread_id] : undefined, innerWidth);
     const capacity = Math.max(1, room - 2);
     const offset = Math.min(profileOffset, Math.max(0, rows.length - capacity));
-    body = [T(`PROFILE · ${selected?.name || ''}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
+    body = [T(`■  PROFILE · ${selected?.name || ''}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
       ...rows.slice(offset, offset + capacity).map((row, index) => T(row.text, row.color, {key: index, bold: row.bold, wrap: 'truncate-end'})),
       T('↑↓ scroll · ^E edit · Esc', C.muted, {key: 'hint', wrap: 'truncate-end'})];
   } else if (mode === 'detail') {
     const lines = wrapBody(safeTerminalText(detailMessage?.body || ''), Math.max(8, innerWidth));
     const count = Math.max(1, room - 2);
     const offset = Math.min(detailOffset, Math.max(0, lines.length - count));
-    body = [T('MESSAGE', C.cyan, {bold: true, key: 'title'}), T(`${detailMessage?.sender_name || ''} ▸ human`, C.muted, {key: 'who', wrap: 'truncate-end'}),
+    body = [T('■  MESSAGE', C.cyan, {bold: true, key: 'title'}), T(`${detailMessage?.sender_name || ''} ▸ human`, C.muted, {key: 'who', wrap: 'truncate-end'}),
       ...lines.slice(offset, offset + count).map((line, index) => T(line || ' ', C.foreground, {key: index, wrap: 'truncate-end'}))];
   } else if (mode === 'confirm-remove') {
-    body = [T('REMOVE SESSION', C.cyan, {bold: true, key: 'title'}), T(selected?.name || '', C.foreground, {key: 'name', wrap: 'truncate-end'}), T('From this workspace only', C.muted, {key: 'scope'}), T('Codex session is kept', C.muted, {key: 'kept'}), T('Y remove · Esc cancel', C.yellow, {key: 'hint', wrap: 'truncate-end'})];
+    body = [T('■  REMOVE SESSION', C.cyan, {bold: true, key: 'title'}), T(selected?.name || '', C.foreground, {key: 'name', wrap: 'truncate-end'}), T('From this workspace only', C.muted, {key: 'scope'}), draft?.removeReviewer ? T('Paired CR also removed', C.yellow, {key: 'pair'}) : draft?.removeCR ? T('CR pairing will be disabled', C.yellow, {key: 'pair'}) : null, T(draft?.removeReviewer ? 'Codex sessions are kept' : 'Codex session is kept', C.muted, {key: 'kept'}), T('Y remove · Esc cancel', C.yellow, {key: 'hint', wrap: 'truncate-end'})];
+  } else if (mode === 'review-action') {
+    body = [T('■  REVIEW', C.cyan, {bold: true, key: 'title'}),
+      T(`Round ${draft?.review?.current_round || 0} · ${String(draft?.review?.status || '').toUpperCase()}`, C.foreground, {key: 'status', wrap: 'truncate-end'}),
+      T('N  Start a new review', C.purple, {key: 'new'}),
+      T(['waiting', 'failed'].includes(draft?.review?.status) ? 'R  Review again' : draft?.review?.status === 'unknown' ? 'Check session before retry' : 'R  Wait for current review', C.purple, {key: 'again', wrap: 'truncate-end'}),
+      T('Esc back', C.muted, {key: 'hint'})];
   } else if (mode === 'confirm-delete-space') {
     const memberCount = draft?.memberCount ?? 0;
     const messageCount = draft?.messageCount ?? 0;
@@ -1022,13 +1236,14 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
     const counts = room < (draft?.replacement ? 7 : 6) ?
       [T(`${memberLabel} · ${messageLabel}`, C.muted, {key: 'counts', wrap: 'truncate-end'})] :
       [T(`Removes ${memberLabel}`, C.muted, {key: 'members'}), T(`and ${messageLabel}`, C.muted, {key: 'messages', wrap: 'truncate-end'})];
-    body = [T('DELETE WORKSPACE', C.cyan, {bold: true, key: 'title'}), T(draft?.spaceName || '', C.foreground, {key: 'name', wrap: 'truncate-end'}),
+    body = [T('■  DELETE WORKSPACE', C.cyan, {bold: true, key: 'title'}), T(draft?.spaceName || '', C.foreground, {key: 'name', wrap: 'truncate-end'}),
       ...counts,
       T('Codex sessions/repos stay', C.muted, {key: 'kept'}), draft?.replacement ? T('Creates an empty workspace', C.muted, {key: 'replacement', wrap: 'truncate-end'}) : null,
       T('Y delete · Esc cancel', C.yellow, {key: 'hint', wrap: 'truncate-end'})];
   } else if (mode !== 'normal') {
-    const labels = {'new-space': 'WORKSPACE NAME', 'picker-search': 'SEARCH SESSIONS', 'join-name': 'NAME THIS SESSION', 'join-role': 'ROLE / DESCRIPTION', 'edit-name': 'NODE NAME', 'edit-role': 'ROLE / DESCRIPTION'};
-    body = [T(labels[mode] || '', C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}), T('Enter confirm · Esc cancel', C.muted, {key: 'hint', wrap: 'truncate-end'}), T(`› ${input}▌`, C.foreground, {key: 'input', wrap: 'wrap'})];
+    const labels = {'new-space': 'WORKSPACE NAME', 'picker-search': 'SEARCH SESSIONS', 'join-name': 'NAME THIS SESSION', 'join-role': 'ROLE / DESCRIPTION', 'edit-name': 'NODE NAME', 'edit-role': 'ROLE / DESCRIPTION', 'review-goal': 'REVIEW GOAL', 'review-base': 'BASE REF (BLANK: HEAD)', 'review-paths': 'PATHS (BLANK: ALL)', 'review-rules': 'WORKSPACE REVIEW RULES'};
+    const hint = mode === 'review-paths' ? 'Comma-separated · Enter' : mode === 'review-goal' || mode === 'review-base' ? 'Enter next · Esc cancel' : 'Enter confirm · Esc cancel';
+    body = [T(`■  ${labels[mode] || ''}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}), T(hint, C.muted, {key: 'hint', wrap: 'truncate-end'}), T(`› ${input}▌`, C.foreground, {key: 'input', wrap: 'wrap'})];
   } else if (view !== 'activity' && selection === 0 && focus !== 'nodes') {
     const isInbox = view !== 'activity';
     const count = Math.max(1, Math.floor((room - 1) / 2));
@@ -1048,7 +1263,7 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
       const state = node.thread_id === HUMAN ? (unreadCount ? `${unreadCount} NEW` : attentionCount ? `${attentionCount} OPEN` : 'YOU') : statusLabel(statusMap[node.thread_id]);
       return h(Box, {key: `${node.thread_id}:name`}, h(Box, {width: 2, flexShrink: 0}, T(active ? '▸ ' : '  ', C.yellow)),
         h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'}, T(node.name, active ? C.pathActive : C.foreground, {bold: active, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, active ? C.yellow : C.muted)));
+        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, active))));
     });
   }
   const editor = showEditor ? h(Box, {height: 2, flexDirection: 'column', key: 'editor'},
@@ -1056,32 +1271,30 @@ function CompactSidebar({size, selected, members, selection, sidebarScroll, stat
     T(`Reply to ${composeTarget.member.name}${sending ? ' · SENDING' : ' · Enter send'}`, C.muted, {wrap: 'truncate-end'})) : null;
   const visibleBody = body.filter(Boolean);
   if (visibleBody.length > room) visibleBody.splice(Math.max(0, room - 1), visibleBody.length - room);
-  return h(Box, {width, height, borderStyle: 'single', borderColor: C.purple, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
+  return h(Box, {width, height, borderStyle: PIXEL_BORDER, borderColor: C.purple, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
     h(AnLeBrand, {width: innerWidth, separator: true}),
     h(Box, {flexGrow: 1, flexShrink: 1, flexDirection: 'column', overflow: 'hidden'}, ...visibleBody), editor,
     T(view === 'activity' ? 'Activity · ^V return · Enter' : safeTerminalText(notice).replaceAll('\n', ' '), C.muted, {wrap: 'truncate-end'}),
-    T(nodeOverflow ? '↑↓ select · Pg scroll' : '↑↓ select · Enter', C.muted, {wrap: 'truncate-end'}),
-    T('^A add · ^X rm · ^O profile', C.muted, {wrap: 'truncate-end'}),
-    T(`^N inbox · ^D del · ^U ${desktopNotifications ? 'ON' : 'OFF'}`, C.muted, {wrap: 'truncate-end'}),
-    T('F6 list · ^P help · ^Q quit', C.muted, {wrap: 'truncate-end'}));
+    T(mode === 'help' ? 'PgUp/PgDn page' : nodeOverflow ? '↑↓ select · Pg scroll' : '↑↓ select · Enter open', C.muted, {wrap: 'truncate-end'}),
+    h(Box, {overflow: 'hidden'}, T('^A', C.purple, {bold: true}), T(' add  ', C.muted), T('^N', C.purple, {bold: true}), T(' inbox  ', C.muted), T('^P', C.purple, {bold: true}), T(' help', C.muted)));
 }
 
 function Header({connection, spaceCount, unreadCount}) {
   return h(Box, {height: 4, paddingX: 1, justifyContent: 'space-between'},
     h(AnLeBrand, {width: 22}),
     h(Box, {flexDirection: 'column', alignItems: 'flex-end'},
-      T('✦  SIGNAL', C.yellow, {bold: true}),
-      T(`${connection === 'CONNECTED' ? '●' : '○'} ${connection}`, connection === 'CONNECTED' ? C.green : C.red),
+      T('■  SIGNAL', C.yellow, {bold: true}),
+      T(`${connection === 'CONNECTED' ? '■' : '□'} ${connection}`, connection === 'CONNECTED' ? C.green : C.red),
       T(`${spaceCount} ${spaceCount === 1 ? 'WORKSPACE' : 'WORKSPACES'}`, C.muted),
-      T(unreadCount ? `◆ ${unreadCount} NEW · ^N INBOX` : '^N INBOX', unreadCount ? C.yellow : C.muted, {bold: unreadCount > 0}),
+      T(unreadCount ? `▪ ${unreadCount} NEW · ^N INBOX` : '^N INBOX', unreadCount ? C.yellow : C.muted, {bold: unreadCount > 0}),
     ));
 }
 
 function Sidebar({space, members, selectedIndex, sidebarScroll, statusMap, unreadCount, attentionCount, width, height}) {
   const nodes = [{name: 'human', thread_id: HUMAN, role: 'You'}, ...members];
   const {rows} = sidebarNodeWindow({nodes, selection: selectedIndex, innerWidth: width - 4, rowCapacity: height - 5, indent: 4, scrollShift: sidebarScroll});
-  return h(Box, {width, height, borderStyle: 'single', borderColor: C.purple, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
-    T('▣  WORKSPACE', C.purple, {bold: true}),
+  return h(Box, {width, height, borderStyle: PIXEL_BORDER, borderColor: C.purple, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
+    T('■  WORKSPACE', C.purple, {bold: true}),
     T(space?.name || '', C.foreground, {wrap: 'truncate-end'}),
     T('─'.repeat(Math.max(4, width - 4)), C.muted),
     ...rows.map(({node, index, type, text, part}) => {
@@ -1094,47 +1307,53 @@ function Sidebar({space, members, selectedIndex, sidebarScroll, statusMap, unrea
           T(` ${node.thread_id === HUMAN ? '▧' : '▣'} `, C.foreground, {bold: selected})),
         h(Box, {flexGrow: 1, flexShrink: 1, overflow: 'hidden'},
           T(node.name, selected ? C.pathActive : C.foreground, {bold: selected, wrap: 'truncate-end'})),
-        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, selected ? C.yellow : C.muted)));
+        h(Box, {marginLeft: 1, flexShrink: 0}, T(state, nodeStateColor(state, selected))));
     }),
     members.length === 0 ? T('  Ctrl+A: add session', C.muted, {wrap: 'truncate-end'}) : null,
   );
 }
 
-function petRows(art, withNames = false) {
-  const artWidth = art[0]?.reduce((width, run) => width + stringWidth(run.text), 0) || 0;
-  const indent = art === EMPTY_INBOX_PETS ? 2 : 1;
-  const gap = art === EMPTY_INBOX_PETS ? 3 : 1;
-  const dogWidth = Math.floor((artWidth - indent - gap) / 2);
-  return [
-    ...art.map((runs, index) => h(Text, {key: `pet-${index}`},
-      ...runs.map((run, i) => T(run.text, run.color, {key: i, backgroundColor: run.backgroundColor})))),
-    withNames ? h(Text, {key: 'pet-names', bold: true},
-      T(' '.repeat(indent + Math.floor((dogWidth - 2) / 2))), T('An', C.an),
-      T(' '.repeat(dogWidth + gap - 2)), T('Le', C.foreground)) : null,
-  ];
+function PetAnimation({width, indent = ''}) {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    // Hold the resting poses without redrawing the terminal four times a second.
+    const delay = (frame === 0 ? 4 : frame === 23 ? 9 : 1) * PET_FRAME_MS;
+    const next = frame === 0 ? 4 : frame === 23 ? 0 : frame + 1;
+    const timer = setTimeout(() => setFrame(next), delay);
+    return () => clearTimeout(timer);
+  }, [frame]);
+  const {rows} = petFrame(frame, width);
+  return h(Box, {width: width + indent.length, height: PET_SCENE_HEIGHT, flexDirection: 'column', overflow: 'hidden'},
+    ...rows.map((runs, index) => h(Text, {key: index},
+      indent ? T(indent, C.foreground, {key: 'indent'}) : null,
+      ...runs.map((run, i) => T(run.text, run.color === 'an' ? C.an : run.color === 'hit' ? C.yellow : C.foreground, {key: i})))));
 }
 
-function MainPanel({mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, statusMap, width, height}) {
+function MainPanel({mode, space, selected, view, connection, contentMessages, conversationList, conversationId, detailMessage, detailLines, detailRoom, messageRoom, messageStart, scrollInfo, messageSelection, focus, detailOffset, unreadCount, attentionCount, inboxPendingOnly, sessionHistory, sessionRows, sessionOffset, composeTarget, inlineDraft, composeHeight, petLayout, sending, pickerNodes, pickerSelection, pickerScroll, pickerLoading, input, draft, profileOffset, helpOffset, statusMap, width, height}) {
   let body;
-  const contentWidth = width - (scrollInfo ? 1 : 0) - (petLayout?.sideWidth || 0);
-  const showMiniPets = petLayout?.kind === 'mini' && (mode === 'detail' || contentMessages.length > 0 || contentWidth - 4 < COMPACT_INBOX_PETS_WIDTH);
+  const geometry = scrollInfo && scrollbarGeometry(scrollInfo.total, scrollInfo.visible, scrollInfo.position, scrollInfo.trackLength);
+  const contentWidth = width - (geometry?.maxPosition ? 1 : 0) - (petLayout?.sideWidth || 0);
+  const showMiniPets = petLayout?.kind === 'mini';
   const headingRows = (first, second, third) => showMiniPets ? [h(Box, {key: 'pet-heading', height: 3, flexDirection: 'row', overflow: 'hidden'},
     h(Box, {flexGrow: 1, flexShrink: 1, flexDirection: 'column', overflow: 'hidden'}, first, second, third),
-    h(Box, {width: MINI_INBOX_PETS_WIDTH, marginLeft: 1, flexShrink: 0, flexDirection: 'column'}, ...petRows(MINI_INBOX_PETS)))] : [first, second, third];
+    h(Box, {width: PET_COMPACT_WIDTH, marginLeft: 1, flexShrink: 0, flexDirection: 'column'}, h(PetAnimation, {width: PET_COMPACT_WIDTH})))] : [first, second, third];
   if (mode === 'picker') {
     const {rows} = sidebarNodeWindow({nodes: pickerNodes, selection: pickerSelection, innerWidth: Math.max(1, width - 4), rowCapacity: Math.max(1, height - 4), scrollShift: pickerScroll});
-    body = [T('▣  SELECT A SESSION', C.cyan, {bold: true, key: 'title'}),
+    body = [T('■  SELECT A SESSION', C.cyan, {bold: true, key: 'title'}),
       T('↑↓ select  ·  / search  ·  Enter  ·  Esc back', C.muted, {key: 'hint', wrap: 'truncate-end'}),
       ...renderPickerRows(rows, pickerSelection, {idLength: 8, showStatus: true, innerWidth: Math.max(1, width - 4)}),
       pickerNodes.length === 0 ? T(pickerLoading ? 'Loading sessions…' : 'No matching sessions. Press / to search.', C.muted, {key: 'empty', wrap: 'truncate-end'}) : null];
   } else if (mode === 'help') {
-    body = [T('▣  KEYBOARD SHORTCUTS', C.cyan, {bold: true, key: 'title'}),
-      ...['Type to message · Enter send', 'Tab focus · ↑↓ select/scroll', 'Ctrl+O agent profile', 'Ctrl+N inbox · Ctrl+V activity', 'Ctrl+U desktop alerts', 'Ctrl+A add · Ctrl+E edit', 'Ctrl+X remove · Ctrl+L intro', 'Ctrl+R refresh · Ctrl+G switch', 'Ctrl+W new · Ctrl+D delete workspace', 'Ctrl+S connect · Ctrl+Q quit', 'Press any key to return'].map(line => T(line, C.muted, {key: line, wrap: 'truncate-end'}))];
+    const capacity = Math.max(1, height - 4);
+    const offset = Math.min(helpOffset, Math.max(0, CLASSIC_HELP_LINES.length - capacity));
+    body = [T(`■  KEYBOARD SHORTCUTS  ${offset + 1}-${Math.min(offset + capacity, CLASSIC_HELP_LINES.length)}/${CLASSIC_HELP_LINES.length}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
+      ...renderHelpRows(CLASSIC_HELP_LINES.slice(offset, offset + capacity)),
+      T('↑↓ scroll · Esc back', C.muted, {key: 'hint', wrap: 'truncate-end'})];
   } else if (mode === 'profile') {
     const rows = profileLines(selected, connection === 'CONNECTED' ? statusMap[selected?.thread_id] : undefined, Math.max(8, width - 4));
     const capacity = Math.max(1, height - 4);
     const offset = Math.min(profileOffset, Math.max(0, rows.length - capacity));
-    body = [T(`▣  PROFILE · ${selected?.name || ''}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
+    body = [T(`■  PROFILE · ${selected?.name || ''}`, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
       T('↑↓ scroll · Ctrl+E edit role · Esc back', C.muted, {key: 'hint', wrap: 'truncate-end'}),
       ...rows.slice(offset, offset + capacity).map((row, index) => T(row.text, row.color, {key: index, bold: row.bold, wrap: 'truncate-end'}))];
   } else if (mode === 'detail') {
@@ -1142,22 +1361,28 @@ function MainPanel({mode, space, selected, view, connection, contentMessages, co
     const lines = detailLines;
     const room = detailRoom;
     const offset = Math.min(detailOffset, Math.max(0, lines.length - room));
-    body = [...headingRows(T('▣  MESSAGE DETAILS', C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
+    body = [...headingRows(T('■  MESSAGE DETAILS', C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}),
       T(`${message?.space_name || ''} · ${message?.sender_name || ''} ▸ ${message?.recipient_name || ''} · ${message ? deliveryLabel(message) : ''}${message && replyLabel(message) ? ` · ${replyLabel(message)}` : ''}   ${formatDate(message?.created_at)}`, C.muted, {key: 'who', wrap: 'truncate-end'}),
       T(composeTarget ? 'Type below to reply · Enter send · Esc back' : '↑↓ scroll · Esc back', C.muted, {key: 'hint', wrap: 'truncate-end'})),
       ...lines.slice(offset, offset + room).map((line, index) => T(line || ' ', C.foreground, {key: index, wrap: 'truncate-end'}))];
   } else if (mode === 'confirm-remove') {
-    body = [T('▣  REMOVE NODE', C.cyan, {bold: true, key: 'title'}), T(`Remove ${selected?.name} from ${space.name}?`, C.foreground, {key: 'body', wrap: 'truncate-end'}), T('Y confirm · any other key cancels', C.yellow, {key: 'hint', wrap: 'truncate-end'}), T('The original session will be kept.', C.muted, {key: 'detail', wrap: 'truncate-end'})];
+    body = [T('■  REMOVE NODE', C.cyan, {bold: true, key: 'title'}), T(`Remove ${selected?.name} from ${space.name}?`, C.foreground, {key: 'body', wrap: 'truncate-end'}), draft?.removeReviewer ? T(`Also removes ${draft.removeReviewer} from this workspace.`, C.yellow, {key: 'pair', wrap: 'truncate-end'}) : draft?.removeCR ? T('This disables the CR pairing.', C.yellow, {key: 'pair'}) : null, T('Y confirm · any other key cancels', C.yellow, {key: 'hint', wrap: 'truncate-end'}), T('The original sessions will be kept.', C.muted, {key: 'detail', wrap: 'truncate-end'})];
+  } else if (mode === 'review-action') {
+    body = [T('■  REVIEW', C.cyan, {bold: true, key: 'title'}),
+      T(`Round ${draft?.review?.current_round || 0} · ${String(draft?.review?.status || '').toUpperCase()}`, C.foreground, {key: 'status', wrap: 'truncate-end'}),
+      T('N  Start a new review', C.purple, {key: 'new'}),
+      T(['waiting', 'failed'].includes(draft?.review?.status) ? 'R  Review again' : draft?.review?.status === 'unknown' ? 'Check session before retry' : 'R  Wait for current review', C.purple, {key: 'again'}),
+      T('Esc back', C.muted, {key: 'hint'})];
   } else if (mode === 'confirm-delete-space') {
-    body = [T('▣  DELETE WORKSPACE', C.cyan, {bold: true, key: 'title'}), T(draft?.spaceName || '', C.foreground, {key: 'name', wrap: 'truncate-end'}),
+    body = [T('■  DELETE WORKSPACE', C.cyan, {bold: true, key: 'title'}), T(draft?.spaceName || '', C.foreground, {key: 'name', wrap: 'truncate-end'}),
       T(`Removes ${draft?.memberCount ?? 0} node${draft?.memberCount === 1 ? '' : 's'} and ${draft?.messageCount ?? 0} AnLe message${draft?.messageCount === 1 ? '' : 's'}.`, C.muted, {key: 'scope', wrap: 'truncate-end'}),
       T('Original Codex sessions and repositories are kept.', C.muted, {key: 'kept', wrap: 'truncate-end'}),
       draft?.replacement ? T('An empty workspace will be created.', C.muted, {key: 'replacement', wrap: 'truncate-end'}) : null,
       T('Y delete · Esc cancel', C.yellow, {key: 'hint'})];
   } else if (mode !== 'normal') {
-    const labels = {'new-space': 'WORKSPACE NAME', 'picker-search': 'SEARCH BY NAME, DIRECTORY OR ID', 'join-name': 'NAME THIS SESSION', 'join-role': 'ROLE / DESCRIPTION (OPTIONAL)', 'edit-name': 'NODE NAME', 'edit-role': 'ROLE / DESCRIPTION'};
-    body = [T(`▣  ${labels[mode]}`, C.cyan, {bold: true, key: 'title'}),
-      T(mode === 'join-name' ? 'Name used in AnLe · Enter confirm · Esc cancel' : mode === 'join-role' ? 'An introduction is queued after joining.' : 'Enter confirm  ·  Esc cancel', C.muted, {key: 'hint', wrap: 'truncate-end'}),
+    const labels = {'new-space': 'WORKSPACE NAME', 'picker-search': 'SEARCH BY NAME, DIRECTORY OR ID', 'join-name': 'NAME THIS SESSION', 'join-role': 'ROLE / DESCRIPTION (OPTIONAL)', 'edit-name': 'NODE NAME', 'edit-role': 'ROLE / DESCRIPTION', 'review-goal': 'REVIEW GOAL', 'review-base': 'BASE REF (BLANK: HEAD)', 'review-paths': 'PATHS (BLANK: ALL)', 'review-rules': 'WORKSPACE REVIEW RULES'};
+    body = [T(`■  ${labels[mode]}`, C.cyan, {bold: true, key: 'title'}),
+      T(mode === 'review-paths' ? 'Comma-separated paths · Enter starts review · Esc cancel' : mode === 'review-goal' || mode === 'review-base' ? 'Enter next · Esc cancel' : mode === 'join-name' ? 'Name used in AnLe · Enter confirm · Esc cancel' : mode === 'join-role' ? 'An introduction is queued after joining.' : 'Enter confirm  ·  Esc cancel', C.muted, {key: 'hint', wrap: 'truncate-end'}),
       h(Box, {key: 'input', marginTop: 1, borderStyle: 'single', borderColor: C.yellow, paddingX: 1}, T(`› ${input}▌`, C.foreground, {wrap: 'wrap'}))];
   } else if (view === 'node' && selected?.thread_id !== HUMAN) {
     const matches = sessionHistory.threadId === selected?.thread_id;
@@ -1169,7 +1394,7 @@ function MainPanel({mode, space, selected, view, connection, contentMessages, co
     const loading = !matches || sessionHistory.loading;
     const error = connection === 'DISCONNECTED' ? 'Codex is disconnected. Press Ctrl+R to reconnect.' : matches ? sessionHistory.error : '';
     body = [h(Box, {key: 'title', justifyContent: 'space-between'},
-      T(`▣  SESSION · ${selected?.name || ''}`, C.cyan, {bold: true, wrap: 'truncate-end'}),
+      T(`■  SESSION · ${selected?.name || ''}`, C.cyan, {bold: true, wrap: 'truncate-end'}),
       T(loading ? 'LOADING' : 'CHAT', C.muted)),
       T(error ? `Could not load history: ${error}` : 'PgUp/PgDn scroll · Ctrl+V activity', error ? C.red : C.muted, {key: 'hint', wrap: 'truncate-end'}),
       T('─'.repeat(Math.max(4, contentWidth - 4)), C.muted, {key: 'line'}),
@@ -1179,21 +1404,18 @@ function MainPanel({mode, space, selected, view, connection, contentMessages, co
     const isInbox = view === 'node';
     const available = messageRoom;
     const start = messageStart;
-    const artWidth = contentWidth - 4;
-    const petArt = height >= 18 && artWidth >= EMPTY_INBOX_PETS_WIDTH ? EMPTY_INBOX_PETS :
-      artWidth >= COMPACT_INBOX_PETS_WIDTH ? COMPACT_INBOX_PETS : [];
-    const showPetNames = petArt.length > 0 && (petArt === EMPTY_INBOX_PETS || height >= 11);
-    const inboxTitle = `▣  YOUR INBOX${inboxPendingOnly ? ' · OPEN' : ''}`;
+    const inboxTitle = `■  YOUR INBOX${inboxPendingOnly ? ' · OPEN' : ''}`;
     const inboxSummary = [unreadCount ? `${unreadCount} NEW` : '', attentionCount ? `${attentionCount} OPEN` : ''].filter(Boolean).join(' · ');
-    const activityTitle = conversationList ? '▣  CONVERSATIONS' : conversationId ? '▣  CONVERSATION' : '▣  ACTIVITY';
+    const activityTitle = conversationList ? '■  CONVERSATIONS' : conversationId ? '■  CONVERSATION' : '■  ACTIVITY';
     const title = showMiniPets ? T(inboxTitle, C.cyan, {bold: true, key: 'title', wrap: 'truncate-end'}) :
       h(Box, {key: 'title', justifyContent: 'space-between'}, T(isInbox ? inboxTitle : activityTitle, C.cyan, {bold: true, wrap: 'truncate-end'}), T(isInbox && inboxSummary ? inboxSummary : `${contentMessages.length} ${conversationList ? 'THREADS' : contentMessages.length === 1 ? 'MESSAGE' : 'MESSAGES'}`, isInbox && inboxSummary ? C.yellow : C.muted));
     const missingSender = isInbox && focus !== 'nodes' && contentMessages[messageSelection] && !composeTarget;
-    const hint = missingSender ? 'Session removed · ^D done' : showMiniPets ? (isInbox ? '↑↓ · ^T open · ^D done' : '↑↓ · Enter') :
+    const hint = missingSender ? 'Session removed · ^D done' : showMiniPets && isInbox && focus !== 'nodes' ? '↑↓ select' : contentWidth < 55 && isInbox && focus !== 'nodes' ? '↑↓ select  ^T open  ^D done' :
       focus !== 'nodes' ? (isInbox ? '↑↓ select · type to reply · ^T open · ^D done' : conversationList ? '↑↓ select · Enter open · ^T messages' : conversationId ? '↑↓ select · Enter details · ^O sender · ^P recipient · Esc back' : '↑↓ select · Enter details · ^T threads · ^O sender · ^P recipient') : isInbox ? 'Ctrl+N inbox · Tab select messages' : `Selected: ${selected?.name || 'human'} · Tab select messages`;
     body = [...headingRows(title, T(hint, C.muted, {wrap: 'truncate-end', key: 'selected'}),
-      T('─'.repeat(Math.max(1, contentWidth - 4 - (showMiniPets ? MINI_INBOX_PETS_WIDTH + 1 : 0))), C.muted, {key: 'line'})),
+      T(showMiniPets ? '^T open ^D done' : '─'.repeat(Math.max(1, contentWidth - 4)), C.muted, {key: 'line', wrap: 'truncate-end'})),
       ...contentMessages.slice(start, start + available).map((message, index) => {
+        const active = focus !== 'nodes' && start + index === messageSelection;
         const isUnread = message.recipient_id === HUMAN && !message.human_read_at;
         const response = replyLabel(message);
         const short = contentWidth < 55;
@@ -1204,31 +1426,30 @@ function MainPanel({mode, space, selected, view, connection, contentMessages, co
         const stateColor = message.issue_count || message.state === 'failed' || message.state === 'unknown' || ['failed', 'unknown'].includes(message.reply_state) ? C.red : isUnread || humanNeedsAttention(message) ? C.yellow : C.muted;
         return h(Box, {key: message.id, flexDirection: 'column'},
           h(Box, {height: 1, overflow: 'hidden'},
-            h(Box, {flexShrink: 0}, T(focus !== 'nodes' && start + index === messageSelection ? '▸' : ' ', C.yellow), T(formatTime(message.latest_at || message.created_at), C.muted)),
+            h(Box, {flexShrink: 0}, T(active ? '▸ ' : '  ', C.yellow), T(formatTime(message.latest_at || message.created_at), C.muted)),
             h(Box, {flexGrow: 1, flexShrink: 1, marginLeft: 2, overflow: 'hidden'},
-              T(conversationList ? message.participants.map(participant => participant.name).join(' ▸ ') : message.sender_name, C.purple, {wrap: 'truncate-end'}),
+              T(conversationList ? message.participants.map(participant => participant.name).join(' ▸ ') : message.sender_name, active ? C.pathActive : C.purple, {bold: active || isUnread, wrap: 'truncate-end'}),
               conversationList ? null : isInbox ? (!short ? T(` · ${message.space_name}`, C.path, {wrap: 'truncate-end'}) : null) : T(` ▸ ${message.recipient_name}`, C.cyan, {wrap: 'truncate-end'})),
             h(Box, {flexShrink: 0, marginLeft: 1}, T(state, stateColor))),
-          T(`  ${!isInbox && !conversationList && short && response ? `${deliveryLabel(message)} · ` : ''}${safeTerminalText(message.body).replaceAll('\n', ' ')}`, C.foreground, {wrap: 'truncate-end'}));
+          h(Text, {wrap: 'truncate-end'}, T('  ▪ ', active ? C.yellow : C.purple), T(`${!isInbox && !conversationList && short && response ? `${deliveryLabel(message)} · ` : ''}${safeTerminalText(message.body).replaceAll('\n', ' ')}`, C.foreground)));
       }),
-      contentMessages.length === 0 ? h(Box, {key: 'empty', flexDirection: 'column', marginTop: !petLayout?.sideWidth && petArt === EMPTY_INBOX_PETS ? 1 : 0},
-        ...(!petLayout?.sideWidth && !showMiniPets ? petRows(petArt, showPetNames) : []),
+      contentMessages.length === 0 ? h(Box, {key: 'empty', flexDirection: 'column', marginTop: petLayout?.kind === 'inline' && height >= 16 ? 1 : 0},
+        petLayout?.kind === 'inline' ? h(PetAnimation, {width: PET_SCENE_WIDTH, indent: '  ', key: 'pets'}) : null,
         T(isInbox ? inboxPendingOnly ? '  No open messages.' : '  No messages for you yet.' : conversationList ? '  No conversations yet.' : '  No collaboration messages yet.', C.muted, {wrap: 'truncate-end'})) : null];
   }
   const editor = composeTarget ? h(Box, {height: composeHeight, flexShrink: 0, flexDirection: 'column', key: 'composer'},
     T('─'.repeat(Math.max(4, width - 4)), C.muted),
     h(Box, null, T('› ', C.yellow), inlineDraft.text ? T(safeTerminalText(draftViewport(inlineDraft, Math.max(1, width - 6))), C.foreground, {wrap: 'truncate-end'}) : T('Type a message… ▌', C.muted, {wrap: 'truncate-end'})),
     T(`${composeTarget.replyTo ? 'Reply to' : 'To'} ${composeTarget.member.name}${composeTarget.spaceName ? ` · ${composeTarget.spaceName}` : ''} · Enter send${sending ? ' · SENDING' : ''}`, C.muted, {wrap: 'truncate-end'})) : null;
-  const geometry = scrollInfo && scrollbarGeometry(scrollInfo.total, scrollInfo.visible, scrollInfo.position, scrollInfo.trackLength);
-  const bar = geometry ? h(Box, {width: 1, flexShrink: 0, flexDirection: 'column', key: 'scrollbar'},
+  const bar = geometry?.maxPosition ? h(Box, {width: 1, flexShrink: 0, flexDirection: 'column', key: 'scrollbar'},
     ...Array.from({length: 3}, (_, index) => T(' ', C.muted, {key: `head-${index}`})),
     ...Array.from({length: geometry.trackLength}, (_, index) => {
       const thumb = geometry.maxPosition > 0 && index >= geometry.thumbStart && index < geometry.thumbStart + geometry.thumbLength;
       return T(thumb ? '█' : '│', thumb ? C.cyan : C.muted, {key: `track-${index}`});
     })) : null;
-  const pets = petLayout?.sideWidth ? h(Box, {width: petLayout.sideWidth, paddingLeft: 1, marginTop: 1, flexShrink: 0, flexDirection: 'column', overflow: 'hidden'},
-    ...petRows(petLayout.art, true)) : null;
-  return h(Box, {width, height, borderStyle: 'single', borderColor: C.cyan, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
+  const pets = petLayout?.kind === 'side' ? h(Box, {width: petLayout.sideWidth, paddingLeft: 1, marginTop: 1, flexShrink: 0, flexDirection: 'column', overflow: 'hidden'},
+    h(PetAnimation, {width: PET_SCENE_WIDTH})) : null;
+  return h(Box, {width, height, borderStyle: PIXEL_BORDER, borderColor: C.cyan, flexDirection: 'column', paddingX: 1, overflow: 'hidden'},
     h(Box, {flexGrow: 1, flexShrink: 1, flexDirection: 'row', overflow: 'hidden'},
       h(Box, {flexGrow: 1, flexShrink: 1, flexDirection: 'column', overflow: 'hidden'}, ...body), pets, bar), editor);
 }
@@ -1262,6 +1483,13 @@ function sessionDisplayRows(entries, width, waitingMessages) {
 
 function statusLabel(value) {
   return {active: 'BUSY', idle: 'IDLE', notLoaded: 'OFFLINE', systemError: 'ERROR'}[value] || 'UNKNOWN';
+}
+
+function nodeStateColor(state, active) {
+  if (state.endsWith(' NEW') || state.endsWith(' OPEN')) return C.yellow;
+  if (state === 'ERROR') return C.red;
+  if (state === 'BUSY') return C.green;
+  return active ? C.yellow : C.muted;
 }
 
 function suggestedName(thread, members) {

@@ -48,6 +48,10 @@ try {
   anle send --to NODE --message TEXT [--context-message ID] [--reply-expected true|false] [--space WORKSPACE]
   anle reply --reply-to ID --message TEXT [--reply-expected true|false] [--space WORKSPACE]
   anle conversation --message-id ID [--space WORKSPACE]
+  anle review --goal TEXT [--base REF] [--paths PATH,PATH] [--space WORKSPACE]
+  anle review --review-id ID [--space WORKSPACE]   Start the next round
+  anle reviews [--space WORKSPACE]                List your review tasks
+  anle review-info --review-id ID [--space WORKSPACE]
 
 Run these commands from a registered Codex session; CODEX_THREAD_ID identifies the sender.
 If the session belongs to multiple workspaces, specify a workspace name or ID with --space.`);
@@ -61,13 +65,27 @@ If the session belongs to multiple workspaces, specify a workspace name or ID wi
       await setupIntegration(client, store.dataDir);
       console.log('AnLe MCP was added to the Codex configuration. Messaging tools are set to be allowed automatically. Existing shared sessions will load the tools after refresh.');
     } finally { client?.close(); store.close(); }
-  } else if (['peers', 'presence', 'send', 'reply', 'conversation'].includes(action)) {
+  } else if (['peers', 'presence', 'send', 'reply', 'conversation', 'review', 'reviews', 'review-info'].includes(action)) {
     const options = parseOptions(rest);
     const store = new Store();
     try {
       const threadId = process.env.CODEX_THREAD_ID;
       const space = resolveAgentSpace(store, threadId, options.space);
-      if (action === 'peers') {
+      if (action === 'review' || action === 'reviews' || action === 'review-info') {
+        const {continueReview, reviewDetails, startReview} = await import('../src/review.js');
+        if (action === 'reviews') {
+          console.log(JSON.stringify({reviews: store.reviews(space.id, threadId)}, null, 2));
+        } else if (action === 'review-info') {
+          console.log(JSON.stringify(reviewDetails(store, space.id, need(options['review-id'], '--review-id'), threadId), null, 2));
+        } else if (options['review-id']) {
+          if (options.goal || options.base || options.paths || options['context-message']) throw new Error('Another round keeps the existing goal, base and scope');
+          const result = await continueReview({store, spaceId: space.id, reviewId: options['review-id'], initiatorId: threadId});
+          console.log(JSON.stringify({review_id: result.review.id, round: result.review.current_round, status: result.review.status, reviewer: result.reviewer.name}));
+        } else {
+          const result = await startReview({store, spaceId: space.id, developerId: threadId, goal: need(options.goal, '--goal'), base: options.base, paths: options.paths ? options.paths.split(',').map(path => path.trim()).filter(Boolean) : [], contextMessageId: options['context-message']});
+          console.log(JSON.stringify({review_id: result.review.id, round: result.review.current_round, status: result.review.status, reviewer: result.reviewer.name}));
+        }
+      } else if (action === 'peers') {
         console.log(JSON.stringify({space: {id: space.id, name: space.name}, self: store.member(space.id, threadId).name, peers: peerList(store, space.id)}, null, 2));
       } else if (action === 'presence') {
         const member = store.updatePresence(space.id, threadId, {task: options.task, status: options.status});
@@ -95,7 +113,7 @@ function parseOptions(args) {
   for (let i = 0; i < args.length; i++) {
     if (!args[i].startsWith('--') || i + 1 >= args.length) throw new Error(`Invalid argument: ${args[i]}`);
     const name = args[i].slice(2);
-    if (!['space', 'to', 'message', 'reply-to', 'context-message', 'reply-expected', 'message-id', 'task', 'status'].includes(name)) throw new Error(`Unknown option: ${args[i]}`);
+    if (!['space', 'to', 'message', 'reply-to', 'context-message', 'reply-expected', 'message-id', 'task', 'status', 'goal', 'base', 'paths', 'review-id'].includes(name)) throw new Error(`Unknown option: ${args[i]}`);
     options[name] = args[++i];
   }
   return options;
